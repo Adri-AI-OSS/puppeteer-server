@@ -1,0 +1,97 @@
+{
+  "$schema": "https://schema.getadri.ai/adri-lib/v1.json",
+  "schema_version": "1",
+  "name": "@adri/puppeteer-server",
+  "version": "1.0.0",
+  "description": "HTTP server for executing Puppeteer code with authenticated browser sessions. The agent launches it, logs in once, then drives a real browser over REST.",
+  "source_tier": "project",
+  "catalog": {
+    "one_liner": "Authenticated browser server the agent launches and drives over HTTP.",
+    "triggers": [
+      "puppeteer",
+      "puppeteer-server",
+      "browser automation",
+      "headless browser",
+      "authenticated browser session"
+    ],
+    "reference_uri": "adri-lib://@adri/puppeteer-server/reference"
+  },
+  "runtime": {
+    "node": ">=18"
+  },
+  "isolation": {
+    "package_managers": ["pnpm"],
+    "default_package_manager": "pnpm",
+    "install_cmd": "pnpm install --frozen-lockfile"
+  },
+  "capabilities": [
+    {
+      "type": "code_library",
+      "id": "puppeteer-server",
+      "language": "javascript",
+      "entrypoint": "index.js",
+      "reference": "REFERENCE.md",
+      "launch": [
+        {
+          "id": "serve",
+          "label": "Start browser server",
+          "icon": "play",
+          "run": {
+            "kind": "terminal",
+            "command": "node",
+            "args": ["{entrypoint_abs}"],
+            "cwd": "{root_abs}"
+          },
+          "params": [
+            {
+              "id": "port",
+              "label": "Port",
+              "type": "number",
+              "default": 3000,
+              "arg": ["--port", "{value}"]
+            },
+            {
+              "id": "url",
+              "label": "Initial URL",
+              "type": "url",
+              "required": false,
+              "description": "Opened in the browser on startup; leave blank to start on about:blank.",
+              "arg": ["--url", "{value}"]
+            },
+            {
+              "id": "headless",
+              "label": "Headless",
+              "type": "boolean",
+              "default": false,
+              "description": "Run without a visible window. Leave off to log in interactively in the terminal.",
+              "arg_when_true": ["--headless"]
+            },
+            {
+              "id": "profile",
+              "label": "Chrome profile directory",
+              "type": "path",
+              "path_kind": "folder",
+              "required": false,
+              "description": "Persists cookies/session between runs. Defaults to .chrome-profile.",
+              "arg": ["--profile", "{value}"]
+            },
+            {
+              "id": "pool",
+              "label": "Enable tab pool (concurrent execution)",
+              "type": "boolean",
+              "default": false,
+              "arg_when_true": ["--pool"]
+            },
+            {
+              "id": "maxTabs",
+              "label": "Max tabs (with pool)",
+              "type": "number",
+              "required": false,
+              "arg": ["--max-tabs", "{value}"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

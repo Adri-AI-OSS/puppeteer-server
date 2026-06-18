@@ -1,0 +1,22 @@
+{
+  "name": "puppeteer-server",
+  "version": "1.0.0",
+  "description": "HTTP server for executing Puppeteer code with authenticated browser sessions",
+  "main": "index.js",
+  "bin": {
+    "puppeteer-server": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^21.0.0"
+  },
+  "keywords": [
+    "puppeteer",
+    "automation",
+    "browser",
+    "scraping"
+  ]
+}
