@@ -5,6 +5,13 @@ runs Puppeteer code against it on demand. Use it to drive web apps that need an
 interactive login (SSO / SAML / OAuth) where raw HTTP requests just get bounced
 to a login page.
 
+Need more than one authenticated session at a time? Launch the server multiple
+times. Leave `port` blank and each instance auto-picks a free port (starting at
+3000) with its own Chrome profile (`.chrome-profile/inst-<port>`), so they never
+collide on the port or Chrome's profile lock. Set an explicit `port` to bind a
+specific one (startup fails if it's already taken). Each instance is an
+independent process driving its own browser — talk to each on its own port.
+
 ## Lifecycle
 
 1. **Launch it** — from the Adri Libraries tree, hit the play button on

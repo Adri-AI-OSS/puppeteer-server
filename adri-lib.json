@@ -47,7 +47,8 @@
               "id": "port",
               "label": "Port",
               "type": "number",
-              "default": 3000,
+              "required": false,
+              "description": "Leave blank to auto-pick a free port (so you can launch several instances). Set a value to bind that exact port; startup fails if it's taken.",
               "arg": ["--port", "{value}"]
             },
             {

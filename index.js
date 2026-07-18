@@ -24,6 +24,8 @@
  */
 
 const readline = require('readline');
+const net = require('net');
+const path = require('path');
 const BrowserManager = require('./lib/browser');
 const CodeExecutor = require('./lib/executor');
 const TabPoolManager = require('./lib/tab-pool');
@@ -33,9 +35,12 @@ const Server = require('./lib/server');
 function parseArgs(args) {
     const options = {
         port: 3000,
+        portExplicit: false,  // true once --port/-p or a positional port is given
         url: null,
         headless: false,
-        profileDir: '.chrome-profile',
+        // `null` => not set on the CLI; main() derives a per-port default so
+        // concurrent instances don't collide on Chrome's profile lock.
+        profileDir: null,
         enablePool: false,
         maxTabs: 10,
         noPrompt: false  // Skip "Press ENTER" prompt for autonomous operation
@@ -51,6 +56,7 @@ function parseArgs(args) {
             case '--port':
             case '-p':
                 options.port = parseInt(next) || 3000;
+                options.portExplicit = true;
                 i++;
                 break;
             case '--url':
@@ -93,6 +99,7 @@ function parseArgs(args) {
     for (const arg of positional) {
         if (/^\d+$/.test(arg)) {
             options.port = parseInt(arg);
+            options.portExplicit = true;
         } else if (arg.startsWith('http://') || arg.startsWith('https://')) {
             options.url = arg;
         }
@@ -109,10 +116,14 @@ Usage:
   node index.js [options]
 
 Options:
-  --port, -p <port>      Server port (default: 3000)
+  --port, -p <port>      Server port. Omit to auto-pick a free port starting
+                         at 3000 (lets you run several instances at once); set
+                         it to bind that exact port (fails if it's taken).
   --url, -u <url>        Initial URL to open in browser
   --headless             Run browser in headless mode
-  --profile, -d <dir>    Chrome profile directory (default: .chrome-profile)
+  --profile, -d <dir>    Chrome profile directory. Defaults to a per-port dir
+                         (.chrome-profile/inst-<port>) so concurrent instances
+                         don't share a profile; a login persists per port.
   --pool                 Enable tab pool for concurrent execution
   --max-tabs <n>         Maximum tabs in pool (default: 10)
   --no-prompt            Skip "Press ENTER" prompt (for autonomous/CI use)
@@ -160,6 +171,38 @@ Example curl commands:
 `);
 }
 
+/**
+ * Find the first free TCP port at or after `startPort`.
+ * Lets the ▶ button be pressed N times without manual --port juggling:
+ * the second instance transparently rolls to the next open port.
+ */
+function findFreePort(startPort, host = 'localhost', maxTries = 100) {
+    return new Promise((resolve, reject) => {
+        let port = startPort;
+        const tryPort = () => {
+            if (port - startPort >= maxTries) {
+                reject(new Error(`No free port found in range ${startPort}-${startPort + maxTries}`));
+                return;
+            }
+            const tester = net.createServer();
+            tester.once('error', err => {
+                tester.close();
+                if (err.code === 'EADDRINUSE') {
+                    port++;
+                    tryPort();
+                } else {
+                    reject(err);
+                }
+            });
+            tester.once('listening', () => {
+                tester.close(() => resolve(port));
+            });
+            tester.listen(port, host);
+        };
+        tryPort();
+    });
+}
+
 function askQuestion(question) {
     const rl = readline.createInterface({
         input: process.stdin,
@@ -182,11 +225,24 @@ async function main() {
     console.log('='.repeat(60));
     console.log();
 
-    // Initialize components
+    // Two port modes:
+    //   - explicit (--port / positional): honor it exactly, fail if taken.
+    //   - default: auto-pick a free port so the ▶ button works N times.
+    // Either way the bind in server.start() is the authoritative reservation —
+    // a probe alone can race a sibling across the slow Chrome-launch window.
+    const requestedPort = options.port;
+    const profileExplicit = options.profileDir != null;
+    if (!options.portExplicit) {
+        options.port = await findFreePort(requestedPort);
+    }
+
+    // Initialize components. The Chrome profile dir is deliberately derived
+    // AFTER the port is bound (below), so two instances that probed the same
+    // free port still end up on distinct ports AND distinct profiles.
     console.log('Initializing browser manager...');
     const browserManager = new BrowserManager({
         headless: options.headless,
-        profileDir: options.profileDir
+        profileDir: options.profileDir  // null unless --profile given; set post-bind
     });
 
     // Initialize tab pool if enabled
@@ -204,6 +260,33 @@ async function main() {
         tabPoolManager
     });
 
+    // Reserve the port FIRST — app.listen is the only race-free reservation.
+    // The browser and its per-port profile come after, so concurrent launches
+    // can't collide on either the port or Chrome's SingletonLock. Only auto-bump
+    // when the port wasn't explicitly requested.
+    try {
+        await server.start({ autoBump: !options.portExplicit });
+    } catch (err) {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`\nPort ${requestedPort} is already in use. ` +
+                `Pass a different --port, or omit --port to auto-pick a free one.`);
+            process.exit(1);
+        }
+        throw err;
+    }
+    options.port = server.options.port;  // authoritative bound port
+    if (options.port !== requestedPort) {
+        console.log(`Port ${requestedPort} unavailable — bound ${options.port} instead.`);
+    }
+
+    // Per-port profile dir when --profile wasn't given: unique per instance so
+    // concurrent instances don't fight over Chrome's SingletonLock, yet stable
+    // across restarts on the same port so a login persists for that instance.
+    if (!profileExplicit) {
+        browserManager.options.profileDir = path.join('.chrome-profile', `inst-${options.port}`);
+    }
+    console.log(`Chrome profile: ${browserManager.options.profileDir}`);
+
     // Launch browser
     console.log('Launching browser...');
     await browserManager.launch();
@@ -215,21 +298,19 @@ async function main() {
         await page.goto(options.url, { waitUntil: 'networkidle2', timeout: 60000 });
     }
 
-    // Wait for user to login (unless --no-prompt is set)
+    // Wait for user to login (unless --no-prompt is set). The HTTP port is
+    // already bound; this just gates the "ready" banner below so the caller
+    // waits for an authenticated session before driving the browser.
     if (!options.noPrompt) {
         console.log();
         console.log('-'.repeat(60));
         console.log('Browser is open. Please log in if authentication is required.');
         console.log('-'.repeat(60));
-        await askQuestion('Press ENTER when ready to start the server...');
+        await askQuestion('Press ENTER when the session is ready...');
     } else {
         console.log();
-        console.log('--no-prompt mode: Starting server immediately...');
+        console.log('--no-prompt mode: session ready immediately...');
     }
-
-    // Start server
-    console.log();
-    await server.start();
 
     console.log();
     console.log('='.repeat(60));
