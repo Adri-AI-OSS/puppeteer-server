@@ -316,7 +316,20 @@ function askQuestion(question) {
  * (system sleep / event-loop stalls), which otherwise leave no trace.
  */
 function installProcessLogging() {
+    // Backstop against exception storms: if the same error keeps recurring,
+    // log it once per window with a count instead of once per occurrence.
+    let lastKey = null, repeats = 0, windowStart = 0;
     process.on('uncaughtException', err => {
+        const key = `${err && err.code}|${err && err.message}`;
+        const now = Date.now();
+        if (key === lastKey && now - windowStart < 60000) {
+            repeats++;
+            return;
+        }
+        if (repeats > 0) {
+            log.error('process', 'uncaughtException repeated', { error: lastKey, suppressed: repeats });
+        }
+        lastKey = key; repeats = 0; windowStart = now;
         log.error('process', 'uncaughtException', { error: err.message, stack: err.stack });
     });
     process.on('unhandledRejection', reason => {
