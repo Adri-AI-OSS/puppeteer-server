@@ -2,3 +2,4 @@ node_modules/
 .chrome-profile/
 *.log
 .DS_Store
+logs/

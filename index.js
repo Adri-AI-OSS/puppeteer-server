@@ -16,6 +16,8 @@
  *   --profile, -d    Chrome profile directory (default: .chrome-profile)
  *   --pool           Enable tab pool for concurrent execution
  *   --max-tabs       Maximum tabs in pool (default: 10)
+ *   --log-dir        Directory for log files (default: <repo>/logs)
+ *   --log-level      debug | info | warn | error (default: info)
  *
  * Examples:
  *   node index.js
@@ -30,6 +32,11 @@ const BrowserManager = require('./lib/browser');
 const CodeExecutor = require('./lib/executor');
 const TabPoolManager = require('./lib/tab-pool');
 const Server = require('./lib/server');
+const log = require('./lib/logger');
+
+// Tee stdout/stderr from the very first line; it's flushed into the log file
+// once the port (and so the file name) is known.
+log.installTee();
 
 // Parse command line arguments
 function parseArgs(args) {
@@ -43,7 +50,9 @@ function parseArgs(args) {
         profileDir: null,
         enablePool: false,
         maxTabs: 10,
-        noPrompt: false  // Skip "Press ENTER" prompt for autonomous operation
+        noPrompt: false,  // Skip "Press ENTER" prompt for autonomous operation
+        logDir: process.env.PUPPETEER_SERVER_LOG_DIR || log.DEFAULT_LOG_DIR,
+        logLevel: process.env.LOG_LEVEL || 'info'
     };
 
     const positional = [];
@@ -81,6 +90,14 @@ function parseArgs(args) {
                 break;
             case '--no-prompt':
                 options.noPrompt = true;
+                break;
+            case '--log-dir':
+                options.logDir = next;
+                i++;
+                break;
+            case '--log-level':
+                options.logLevel = next;
+                i++;
                 break;
             case '--help':
             case '-h':
@@ -127,6 +144,11 @@ Options:
   --pool                 Enable tab pool for concurrent execution
   --max-tabs <n>         Maximum tabs in pool (default: 10)
   --no-prompt            Skip "Press ENTER" prompt (for autonomous/CI use)
+  --log-dir <dir>        Log directory (default: <repo>/logs, or
+                         $PUPPETEER_SERVER_LOG_DIR). Each run writes
+                         puppeteer-server_<port>_<UTC ts>.log and updates the
+                         puppeteer-server_<port>_latest.log symlink.
+  --log-level <level>    debug | info | warn | error (default: info, or $LOG_LEVEL)
   --help, -h             Show this help message
 
 Examples:
@@ -216,9 +238,41 @@ function askQuestion(question) {
     });
 }
 
+/**
+ * Process-level diagnostics: crashes, signals, exit, and wall-clock jumps
+ * (system sleep / event-loop stalls), which otherwise leave no trace.
+ */
+function installProcessLogging() {
+    process.on('uncaughtException', err => {
+        log.error('process', 'uncaughtException', { error: err.message, stack: err.stack });
+    });
+    process.on('unhandledRejection', reason => {
+        const err = reason instanceof Error ? reason : new Error(String(reason));
+        log.error('process', 'unhandledRejection', { error: err.message, stack: err.stack });
+    });
+    process.on('warning', w => log.warn('process', 'node warning', { name: w.name, warning: w.message }));
+    process.on('exit', code => log.info('process', 'exit', { code, uptimeSec: Math.round(process.uptime()) }));
+
+    const TICK_MS = 15000;
+    let last = Date.now();
+    setInterval(() => {
+        const now = Date.now();
+        const gap = now - last - TICK_MS;
+        if (gap > 30000) {
+            log.warn('process', 'clock jumped — system sleep or event-loop stall', {
+                gapSec: Math.round(gap / 1000),
+                from: new Date(last).toISOString()
+            });
+        }
+        last = now;
+    }, TICK_MS).unref();
+}
+
 async function main() {
     const args = process.argv.slice(2);
     const options = parseArgs(args);
+    log.setLevel(options.logLevel);
+    installProcessLogging();
 
     console.log('='.repeat(60));
     console.log('  Puppeteer Server');
@@ -275,6 +329,12 @@ async function main() {
         throw err;
     }
     options.port = server.options.port;  // authoritative bound port
+    const logFile = log.openLogFile({ dir: options.logDir, port: options.port });
+    log.info('server', 'starting', {
+        pid: process.pid, node: process.version, port: options.port,
+        cwd: process.cwd(), args: process.argv.slice(2).join(' ')
+    });
+    console.log(`Log file: ${logFile}`);
     if (options.port !== requestedPort) {
         console.log(`Port ${requestedPort} unavailable — bound ${options.port} instead.`);
     }
@@ -289,13 +349,23 @@ async function main() {
 
     // Launch browser
     console.log('Launching browser...');
-    await browserManager.launch();
+    try {
+        await browserManager.launch();
+    } catch (err) {
+        log.error('server', 'could not start browser', { error: err.message, stack: err.stack });
+        throw err;
+    }
 
     // Navigate to initial URL if provided
     const page = await browserManager.getPage('main');
     if (options.url) {
-        console.log(`Navigating to ${options.url}...`);
-        await page.goto(options.url, { waitUntil: 'networkidle2', timeout: 60000 });
+        log.info('server', 'navigating to initial URL', { url: options.url });
+        try {
+            await page.goto(options.url, { waitUntil: 'networkidle2', timeout: 60000 });
+        } catch (err) {
+            // A slow SSO page shouldn't take the whole server down.
+            log.warn('server', 'initial navigation did not settle', { url: options.url, error: err.message });
+        }
     }
 
     // Wait for user to login (unless --no-prompt is set). The HTTP port is
@@ -339,21 +409,23 @@ async function main() {
     console.log(`    -d '{"code": "return await page.title()"}'`);
     console.log();
     console.log('Press Ctrl+C to stop the server');
+    console.log(`Logs: ${logFile}`);
     console.log();
+    log.info('server', 'ready', { port: options.port, pool: options.enablePool });
 
     // Handle graceful shutdown
     process.on('SIGINT', async () => {
-        console.log('\nShutting down...');
+        log.warn('process', 'SIGINT received; shutting down');
         await server.stop();
     });
 
     process.on('SIGTERM', async () => {
-        console.log('\nShutting down...');
+        log.warn('process', 'SIGTERM received; shutting down');
         await server.stop();
     });
 }
 
 main().catch(err => {
-    console.error('Fatal error:', err);
+    log.error('process', 'fatal error', { error: err.message, stack: err.stack });
     process.exit(1);
 });

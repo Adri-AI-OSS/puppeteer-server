@@ -190,7 +190,39 @@ curl -X POST http://localhost:8080/run \
 | GET | `/status` | Get queue status |
 | GET | `/health` | Health check |
 | POST | `/clear-queue` | Clear pending executions |
+| POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
 | POST | `/shutdown` | Stop server and browser |
+
+If the CDP connection to Chrome drops while Chrome keeps running, the next
+request re-attaches to it via the profile's `DevToolsActivePort` file, so the
+logged-in session survives. Executed code can't call `browser.disconnect()` or
+`browser.close()`, because the connection is shared by every request.
+
+### Logs
+
+Every run writes `logs/puppeteer-server_<port>_<UTC ts>.log` (in the repo,
+regardless of cwd) and points `logs/puppeteer-server_<port>_latest.log` at it.
+This is the same convention as adri-agents' `dev-scripts`. The file captures
+everything printed to stdout and stderr. Override the location with
+`--log-dir <dir>` or `PUPPETEER_SERVER_LOG_DIR`, and the verbosity with
+`--log-level debug|info|warn|error` or `LOG_LEVEL`.
+
+Each line is `[ISO time] LEVEL [scope] message key=value…`. Lines written while
+handling a request carry the same `req=` id, which is also returned in the
+`X-Request-Id` response header. Useful greps:
+
+```bash
+tail -f logs/puppeteer-server_8080_latest.log
+grep 'req=r42' logs/puppeteer-server_8080_latest.log                    # one request end to end
+grep -E '\[browser\]|\[cdp\]' logs/puppeteer-server_8080_latest.log     # connection lifecycle
+grep 'CDP disconnected' logs/puppeteer-server_8080_latest.log           # why the connection dropped
+```
+
+When the connection drops unexpectedly, the server logs the WebSocket close
+code and meaning, the last socket error, the message counts and largest message
+size, which snippet was running, whether Chrome's PID and DevTools endpoint are
+still alive, and a diagnosis. System sleep and event-loop stalls show up as
+`clock jumped` warnings.
 
 ### Pool Endpoints (Concurrent Execution)
 
