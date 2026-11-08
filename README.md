@@ -209,7 +209,34 @@ everything printed to stdout and stderr. Override the location with
 
 Each line is `[ISO time] LEVEL [scope] message key=value…`. Lines written while
 handling a request carry the same `req=` id, which is also returned in the
-`X-Request-Id` response header. Useful greps:
+`X-Request-Id` response header. Log lines are written straight to disk, so they
+survive a crash.
+
+**Full code goes in a separate file.** Each run also writes
+`puppeteer-server_<port>_<ts>.executions.jsonl` (plus a
+`_latest.executions.jsonl` symlink). The text log only shows a short preview of
+the code alongside `run=` and `req=` ids. Every code execution (from `/execute`,
+`/run`, `/goto`, `/page`, `/content`, `/screenshot`, `/cookies` or the pool
+routes) writes these records:
+
+| event | when | contents |
+|---|---|---|
+| `start` | when the request reaches the executor, **before** queueing, page lookup or launch | `run`, `req`, `method`, `path`, `mode`, `page`/`tabId`, `timeoutMs`, the **full `code`** |
+| `exec` | right before the code runs | page `url`, `queuedMs` / `acquireMs` |
+| `end` | exactly once, whatever the outcome | `status` (`ok`, `error`, `timeout` or `cancelled`), `ms`, and on failure `error`, `stack`, `stage` (`getPage`, `acquireTab`, `lookupTab`, `run` or `serialize`); on success `resultType` and `resultBytes` |
+
+The `start` record is written to disk before anything else happens. A run that
+hangs or crashes the server still has its code on record: it's the `start`
+with no matching `end`. API responses include `run`.
+
+```bash
+J=logs/puppeteer-server_8080_latest.executions.jsonl
+grep '"req":"r42"' $J                                  # code and outcome for one request
+jq -r 'select(.run==17 and .event=="start") | .code' $J # the exact code of run 17
+jq -c 'select(.event=="end" and .status!="ok") | {run,req,status,stage,error}' $J
+```
+
+Useful greps on the text log:
 
 ```bash
 tail -f logs/puppeteer-server_8080_latest.log

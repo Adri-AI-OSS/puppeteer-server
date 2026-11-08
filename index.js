@@ -335,6 +335,7 @@ async function main() {
         cwd: process.cwd(), args: process.argv.slice(2).join(' ')
     });
     console.log(`Log file: ${logFile}`);
+    console.log(`Executions (full code): ${log.getExecFilePath()}`);
     if (options.port !== requestedPort) {
         console.log(`Port ${requestedPort} unavailable — bound ${options.port} instead.`);
     }
@@ -410,6 +411,7 @@ async function main() {
     console.log();
     console.log('Press Ctrl+C to stop the server');
     console.log(`Logs: ${logFile}`);
+    console.log(`Executions (full code): ${log.getExecFilePath()}`);
     console.log();
     log.info('server', 'ready', { port: options.port, pool: options.enablePool });
 
