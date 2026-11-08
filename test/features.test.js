@@ -458,9 +458,17 @@ describe('P4 files', () => {
 // ── P5: robustness ──────────────────────────────────────────────────────────
 
 describe('P5 crash recovery', () => {
-    test('#17 a crashed named tab is replaced and reported', async () => {
-        await exec(`await page.goto('chrome://crash').catch(() => {}); return 1`, { timeout: 5000, abortGraceMs: 200 });
-        await sleep(300);
+    const crash = `const s = await page.target().createCDPSession();
+        s.send('Page.crash').catch(() => {});
+        await helpers.wait(5000);
+        return 'not crashed';`;
+
+    test('#17 a run whose tab crashes fails fast; the tab is replaced and reported', async () => {
+        const t0 = Date.now();
+        const c = await exec(crash, { timeout: 15000 });
+        assert.equal(c.success, false, J(c));
+        assert.match(c.error, /tab crashed/);
+        assert.ok(Date.now() - t0 < 4000, 'fails fast, not at the timeout');
         const r = await exec(`await page.goto(${J(FIX + '/plain')}); return page.title();`);
         assert.equal(r.success, true, J(r));
         assert.equal(r.result, 'plain');
@@ -471,9 +479,8 @@ describe('P5 crash recovery', () => {
     });
 
     test('#17 a crashed pool tab is not handed out again', async () => {
-        const c = (await srv.post('/pool/execute', { timeout: 5000, abortGraceMs: 200,
-            code: `await page.goto('chrome://crash').catch(() => {}); return 1` })).body;
-        await sleep(300);
+        const c = (await srv.post('/pool/execute', { timeout: 15000, code: crash })).body;
+        assert.match(c.error, /tab crashed/, J(c));
         const crashedTab = c.tabId;
         for (let i = 0; i < 3; i++) {
             const r = (await srv.post('/pool/execute', { code: 'return page.evaluate(() => 1 + 1)' })).body;

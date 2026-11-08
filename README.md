@@ -275,8 +275,9 @@ Each request runs in its own scope:
   completes. A snippet that opens a popup and then clicks the original page
   should call `await page.bringToFront()` first. Concurrent pool tabs can't all
   be in front at once, so in headless mode prefer `evaluate`-based clicks there.
-- **Crashes.** If a named tab's renderer crashes, the next request replaces it
-  and reports `tabCrashed`. A crashed pool tab is closed instead of being
+- **Crashes.** A run whose tab crashes fails at once ("The tab crashed during
+  the run") instead of waiting for its timeout. If a named tab's renderer
+  crashed, the next request replaces it and reports `tabCrashed`. A crashed pool tab is closed instead of being
   handed out again. If Chrome itself died, the next request launches a new one
   on the same profile and reports `browserRestarted`.
 - **JS dialogs never freeze a tab.** Every managed page (named pages, the
