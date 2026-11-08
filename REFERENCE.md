@@ -19,7 +19,8 @@ independent process driving its own browser — talk to each on its own port.
    `profile`, `pool`, `maxTabs`) → Execute. It opens an integrated terminal
    running `node index.js …`.
 2. **Log in once** — a Chrome window opens (omit `headless`). Complete the login
-   in that window, then press ENTER in the terminal. The session is now live.
+   in that window, then press ENTER in the terminal, or `POST /ready` from
+   another process. The session is now live (`GET /health` → `ready: true`).
 3. **Drive it over HTTP** — POST Puppeteer snippets to `http://localhost:<port>`.
    The browser stays authenticated for the life of the process.
 4. **Stop it** — `POST /shutdown`, or close the terminal.
@@ -42,6 +43,11 @@ Single-session (sequential) endpoints:
 | `GET /cookies` | Cookies for the current context. |
 | `GET /status` · `GET /health` | Server + browser liveness. |
 | `POST /reconnect` | Drop and re-establish the CDP connection to the same Chrome (session kept). Rarely needed: requests auto-reconnect. |
+| `POST /ready` | Mark the session ready (the user finished logging in) instead of pressing ENTER. |
+| `GET /runs` · `GET /runs/:id` | Recent runs; one run's code, status, error, logs, dialogs, page events (live while running). |
+| `GET /jobs/:id` · `POST /jobs/:id/cancel` | Poll / cancel a job started with `"async": true`. |
+| `POST /watch` · `GET /watch/:id?since=N` · `DELETE /watch/:id` | Collect page events across calls (see below). |
+| `GET /artifacts/:id` | Large results and downloads written to disk. |
 | `POST /clear-queue` | Drop queued sequential requests and abort the one running. |
 | `POST /shutdown` | Close the browser and exit. |
 
@@ -67,14 +73,31 @@ The code runs as the body of an async function. In scope:
 - `helpers`: `wait(ms)`, `waitFor(selector, ms)`, `waitUntil(fn)`,
   `waitForContent()`, `getText`, `getAttr`, `getAllText`, `exists`, `getJson`,
   `screenshot`, `getUrl`, `getTitle`, plus `signal` (an AbortSignal) and
-  `checkAborted()` for long loops.
+  `checkAborted()` for long loops, and:
+  - `helpers.download(() => page.click('#export'), { timeout, inlineMaxBytes })`
+    returns `{ filename, bytes, path, data }`, where `data` is base64. Files over
+    `inlineMaxBytes` (default 5 MB) come back as `artifact` instead of `data`.
+  - `helpers.files.<name>`: local paths of files sent with the request, for
+    `elementHandle.uploadFile(...)`.
 
 `return` a JSON-serializable value. Buffers (`page.screenshot()`, `page.pdf()`)
 and typed arrays come back as `{ "$binary": "base64", "data": "…", "bytes": n }`.
 
-Request options (all execute routes): `timeout` (ms, default 30000),
-`returnType` (`auto` | `text` | `none`), `pageName` (sequential routes, default
-`main`), `persist` (see below), `abortGraceMs` (default 5000).
+Request options (all execute routes):
+
+| option | meaning |
+|---|---|
+| `timeout` | ms, default 30000, capped by `--max-timeout` (then `timeoutCappedTo` is set) |
+| `returnType` | `auto` \| `text` \| `none` |
+| `pageName` | sequential routes; default `main` |
+| `async` | `true`: respond `202 { jobId, run }` at once; poll `GET /jobs/:id` |
+| `pageEvents` | `true` (console, pageerror, requestfailed, httpError) or a list of types; returned as `pageEvents` |
+| `screenshotOnError` | attach a PNG (`errorScreenshot`) when the run fails or times out |
+| `files` | `{ name: base64 \| { data, filename } }` → `helpers.files.name` |
+| `persist` | keep listeners, interception, exposed functions, settings, scripts and tabs the run set up |
+| `keepTabs` | keep only the tabs/contexts the run opened |
+| `resultMaxBytes` | spill larger results to an artifact (default 5 MB) |
+| `abortGraceMs` | default 5000 |
 
 Response extras, present only when relevant:
 
@@ -82,8 +105,15 @@ Response extras, present only when relevant:
 |---|---|
 | `logs` | `[{level, msg, ms}]` from `console.*`, also on failure. Capped at 500 lines / 64 KB (`logsTruncated: true`) |
 | `dialogs` | JS dialogs auto-handled during the run: `[{type, message, action, ms}]` |
-| `aborted` | `"timeout"` or `"queue cleared"` |
-| `persisted` | what `persist: true` kept |
+| `aborted` | `"timeout"` or `"queue cleared"`; `cancelled: true` when cancelled |
+| `pageEvents` | page console messages, uncaught errors, failed / 4xx-5xx requests during the run |
+| `errorScreenshot` | `$binary` PNG of the page when the run failed (`screenshotOnError`) |
+| `sessionExpired` | the run ended on a login page (`--login-url-pattern`): ask the user to log in again; `sessionUrl` |
+| `reconnected` | the CDP connection was re-established before this run (`{ ok, attempts, ms }`) |
+| `browserRestarted` | Chrome had died and a new one was launched: session-only cookies and tabs are gone |
+| `tabCrashed` | the named tab had crashed and was replaced |
+| `result.$artifact` | the result was too large and is at `result.url` (`GET /artifacts/:id`) |
+| `persisted` / `keptTabs` | what `persist` / `keepTabs` kept |
 
 Behaviour to rely on:
 
@@ -91,22 +121,44 @@ Behaviour to rely on:
   `helpers` call from it throws `RunAbortedError`, so it can't interfere with
   the next request. Split long flows into several calls rather than raising the
   timeout a lot.
-- **Each call starts clean.** Listeners (`page.on(...)`), request interception
-  and `exposeFunction` set up by a snippet are removed when the call ends. Pass
-  `"persist": true` to keep them across calls. Use `globalThis` or the page
-  itself to carry data between calls.
+- **Each call starts clean.** When the call ends, the server undoes what the
+  snippet set up: listeners (`page.on(...)`), request interception,
+  `exposeFunction`, `evaluateOnNewDocument` scripts, and settings (viewport,
+  user agent, extra headers, offline, JS on/off, cache, media / timezone /
+  geolocation / throttling emulation, `authenticate`, default timeout). It also
+  closes the tabs, popups and incognito contexts the snippet opened. Pass
+  `"persist": true` (or `"keepTabs": true`) to keep them. Use `globalThis` or
+  the page itself to carry data between calls.
+- **Focus.** The sequential page is brought to the front before each run.
+  Headless Chrome doesn't render background tabs, so `page.click()` there never
+  finishes. If your snippet opens a popup and then clicks the original page,
+  call `await page.bringToFront()` first.
 - **Dialogs don't block.** Unless your snippet registers
   `page.on('dialog', ...)`, the server accepts `alert`/`beforeunload` and
   dismisses `confirm`/`prompt`, and reports them in `dialogs`.
 - **Lost browser connection.** If the CDP connection to Chrome drops, the next
   request reconnects to the same Chrome (3 attempts) before running, so the
-  login survives. No `/reconnect` call is needed.
-- **Not available:** streaming or progress output, background jobs, `require`
-  (so you can't launch a second browser). Downloads need
-  `page.createCDPSession()` + `Browser.setDownloadBehavior`.
+  login survives (`reconnected`). If Chrome itself died, a new one is launched
+  and the response says `browserRestarted`.
+- **Long work.** Use `"async": true` and poll `GET /jobs/:id`. It shows `logs`,
+  `dialogs` and `pageEvents` so far, then the full response; `POST
+  /jobs/:id/cancel` stops it. Finished jobs expire after 10 minutes.
+- **Watching across calls.** `POST /watch { "events": [...], "page": "main" |
+  "tabId": "tab-1", "maxEvents": 1000 }` returns a `watchId`. Then `GET
+  /watch/:id?since=<next>` returns new events (`seq`, `ts`, `type`, ...) plus the
+  cursor `next`, `dropped` and `closed`. Types: console, pageerror,
+  requestfailed, httpError, response, request, framenavigated, popup, dialog.
+- **Backpressure.** A full sequential queue returns `429`. A full pool returns
+  `503` after `--acquire-timeout`. Use `async` or the pool for parallel work.
+- **Not available:** streaming over one HTTP response, `require` (so you can't
+  launch a second browser).
 
-Every call's full code, outcome, logs and dialogs are written to
+Every call's full code, outcome, logs, dialogs and page events are written to
 `logs/puppeteer-server_<port>_latest.executions.jsonl`, keyed by `run`.
+`GET /runs/:id` reads it back (`X-Run-Id` header on every execute response).
+
+If the server was started with `--token`, send `Authorization: Bearer <token>`
+on every request (`GET /health` is open).
 
 ## Example
 
@@ -115,6 +167,13 @@ Every call's full code, outcome, logs and dialogs are written to
 curl -s localhost:3000/execute -H 'content-type: application/json' -d '{
   "code": "await page.goto(\"https://api.sap.com\"); return await page.title();"
 }'
+
+# Long export: run async, download the file, poll for the result
+curl -s localhost:3000/execute -H 'content-type: application/json' -d '{
+  "async": true, "timeout": 300000, "screenshotOnError": true,
+  "code": "await page.goto(\"https://app.example.com/reports\"); return helpers.download(() => page.click(\"#export\"));"
+}'                                  # -> 202 {"jobId":"j1",...}
+curl -s localhost:3000/jobs/j1      # -> running (logs so far) ... then the result
 
 # Answer a confirm() yourself, capture console output, keep a 60s budget:
 curl -s localhost:3000/execute -H 'content-type: application/json' -d '{

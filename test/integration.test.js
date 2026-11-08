@@ -8,123 +8,24 @@
 
 const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
-const http = require('node:http');
-const net = require('node:net');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
+const { sleep, startFixture, startServer } = require('./support');
 
-const ROOT = path.resolve(__dirname, '..');
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+let fixture, FIX, BASE, srv;
 
-// ── fixture site ────────────────────────────────────────────────────────────
-
-const PAGES = {
-    '/plain': '<title>plain</title><button id="b">b</button><p>hello</p>',
-    '/alert': '<title>alert</title><script>alert("hello from alert")</script><p>after</p>',
-    '/alert-later': '<title>later</title><script>setTimeout(() => alert("late alert"), 200)</script>',
-    '/confirm': '<title>confirm</title><button id="b" onclick="window.answer = confirm(\'sure?\')">b</button>',
-    '/beforeunload': '<title>bu</title><button id="b">b</button><script>' +
-        'window.addEventListener("beforeunload", e => { e.preventDefault(); e.returnValue = ""; });</script>',
-    '/data.json': null
-};
-
-function startFixture() {
-    return new Promise(resolve => {
-        const srv = http.createServer((req, res) => {
-            const url = req.url.split('?')[0];
-            if (url === '/data.json') {
-                res.writeHead(200, { 'content-type': 'application/json' });
-                return res.end('{"ok":true}');
-            }
-            const body = PAGES[url];
-            if (body == null) { res.writeHead(404); return res.end('nope'); }
-            res.writeHead(200, { 'content-type': 'text/html' });
-            res.end(`<!doctype html><html><body>${body}</body></html>`);
-        });
-        srv.listen(0, '127.0.0.1', () => resolve(srv));
-    });
-}
-
-function freePort() {
-    return new Promise((resolve, reject) => {
-        const s = net.createServer();
-        s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
-        s.on('error', reject);
-    });
-}
-
-// ── server under test ───────────────────────────────────────────────────────
-
-let fixture, FIX, BASE, child, tmp, serverOutput = '';
-
-async function waitForHealthy(timeoutMs = 60000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-        try {
-            const r = await fetch(`${BASE}/health`);
-            if (r.ok) return;
-        } catch { /* not up yet */ }
-        if (child.exitCode !== null) throw new Error(`server exited early:\n${serverOutput}`);
-        await sleep(250);
-    }
-    throw new Error(`server not healthy in ${timeoutMs}ms:\n${serverOutput}`);
-}
-
-async function post(route, body) {
-    const r = await fetch(`${BASE}${route}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body || {})
-    });
-    const text = await r.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = text; }
-    return { status: r.status, headers: r.headers, body: json };
-}
-
-/** /execute with sane defaults; returns the parsed response body. */
-async function exec(code, opts = {}) {
-    return (await post('/execute', { code, timeout: 15000, ...opts })).body;
-}
-
-function execRecords() {
-    const file = path.join(tmp, 'logs', fs.readdirSync(path.join(tmp, 'logs'))
-        .find(f => f.endsWith('.executions.jsonl') && !f.includes('_latest')));
-    return fs.readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
-}
-
-function endRecord(run) {
-    return execRecords().find(r => r.event === 'end' && r.run === run);
-}
+const post = (route, body) => srv.post(route, body || {});
+const exec = (code, opts) => srv.exec(code, opts);
+const endRecord = run => srv.endRecord(run);
 
 before(async () => {
     fixture = await startFixture();
-    FIX = `http://127.0.0.1:${fixture.address().port}`;
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pptr-srv-test-'));
-    const port = await freePort();
-    BASE = `http://localhost:${port}`;
-    child = spawn(process.execPath, [
-        path.join(ROOT, 'index.js'),
-        '--port', String(port), '--headless', '--pool', '--max-tabs', '3', '--no-prompt',
-        '--profile', path.join(tmp, 'profile'), '--log-dir', path.join(tmp, 'logs')
-    ], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LOG_LEVEL: 'info' } });
-    child.stdout.on('data', d => { serverOutput += d; });
-    child.stderr.on('data', d => { serverOutput += d; });
-    await waitForHealthy();
+    FIX = fixture.url;
+    srv = await startServer();
+    BASE = srv.base;
 });
 
 after(async () => {
-    if (child && child.exitCode === null) {
-        try { await post('/shutdown'); } catch { /* ignore */ }
-        const t0 = Date.now();
-        while (child.exitCode === null && Date.now() - t0 < 10000) await sleep(100);
-        if (child.exitCode === null) child.kill('SIGKILL');
-    }
+    if (srv) { await srv.stop(); srv.cleanup(); }
     if (fixture) fixture.close();
-    if (process.env.KEEP_TEST_LOGS) console.log(`test logs kept in ${tmp}`);
-    else fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 // ── regression ──────────────────────────────────────────────────────────────
@@ -282,7 +183,8 @@ describe('P2 cleanup', () => {
     test('persist: true keeps listeners and reports them', async () => {
         const base = (await exec(`return page.listenerCount('x-test-event')`)).result;
         const r = await exec(`page.on('x-test-event', () => {}); return 1`, { persist: true });
-        assert.deepEqual(r.persisted, { listeners: 1, interception: false, exposed: [] });
+        assert.equal(r.persisted.listeners, 1);
+        assert.equal(r.persisted.interception, false);
         assert.equal((await exec(`return page.listenerCount('x-test-event')`)).result, base + 1);
     });
 

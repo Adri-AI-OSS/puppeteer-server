@@ -1,0 +1,45 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          # The server drives system Chrome; skip puppeteer's own download.
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+
+      # ubuntu-latest ships Google Chrome at /usr/bin/google-chrome, which is
+      # where the server looks on Linux.
+      - name: Check Chrome
+        run: google-chrome --version
+
+      - name: Integration tests
+        run: npm test
+        env:
+          KEEP_TEST_LOGS: '1'
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs
+          path: /tmp/pptr-srv-test-*/logs
+          if-no-files-found: ignore

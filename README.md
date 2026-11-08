@@ -97,12 +97,23 @@ node index.js --pool --max-tabs 5 --port 8080 --url https://api.sap.com
 
 # Autonomous mode (skip "Press ENTER" prompt for CI/testing)
 node index.js --pool --max-tabs 5 --port 8080 --no-prompt
+
+# Hardened: token, expired-login detection, limits
+node index.js --port 8080 --token "$TOKEN" --login-url-pattern 'accounts\.sap\.com|/login' \
+  --max-queue 20 --max-timeout 300000 --result-max-bytes 2000000
 ```
 
 1. Browser opens and navigates to the URL
 2. Log in manually if required (skip with `--no-prompt` for autonomous use)
-3. Press ENTER to start the HTTP server
+3. Press ENTER, or `POST /ready` from another process, to mark the session ready
+   (`GET /health` reports `ready`). The port is bound from the start, so
+   requests are accepted even before that.
 4. Server listens on specified port (default: 3000)
+
+Other flags: `--token`, `--login-url-pattern`, `--max-queue` (default 50),
+`--max-timeout` (default 600000), `--result-max-bytes` (default 5242880),
+`--job-ttl-ms` (default 600000), `--acquire-timeout` (pool wait, default 30000).
+See `node index.js --help`.
 
 ### Making Requests
 
@@ -152,6 +163,12 @@ When you send code to `/run` or `/execute`, these objects are available:
   - `helpers.getTitle()` - Get page title
   - `helpers.getJson()` - Parse page content as JSON (useful for API responses)
   - `helpers.screenshot(options)` - Take screenshot as base64
+  - `helpers.download(trigger, {timeout, inlineMaxBytes})` - run `trigger` (e.g.
+    `() => page.click('#export')`) and wait for the download it starts. Returns
+    `{filename, bytes, url, path, data}` with `data` in base64; files over
+    `inlineMaxBytes` (default 5 MB) return `artifact` instead of `data`
+  - `helpers.files` - `{name: localPath}` for files sent with the request
+    (`files` option), for `elementHandle.uploadFile(...)`
 
 #### Smart Wait for Dynamic Content
 
@@ -174,10 +191,16 @@ body `{ code, ...options }`:
 
 | option | default | meaning |
 |---|---|---|
-| `timeout` | `30000` | ms before the run is aborted |
+| `timeout` | `30000` | ms before the run is aborted; capped at `--max-timeout` (response then has `timeoutCappedTo`) |
 | `returnType` | `auto` | `auto`/`json`, `text` or `none` |
 | `pageName` | `main` | named page for the sequential endpoints |
-| `persist` | `false` | keep listeners, request interception and exposed functions the snippet set up (see below) |
+| `async` | `false` | respond `202 {jobId, run, poll}` at once; see [Async jobs](#async-jobs) |
+| `pageEvents` | off | `true` (= `console`, `pageerror`, `requestfailed`, `httpError`) or a list of event types; returned as `pageEvents` |
+| `screenshotOnError` | `false` | attach a PNG of the page (`errorScreenshot`) when the run fails or times out |
+| `files` | none | `{name: base64 \| {data, filename}}`, written to a temp dir for the run; paths in `helpers.files` |
+| `persist` | `false` | keep everything the snippet set up (see [Run lifecycle](#run-lifecycle)) |
+| `keepTabs` | `false` | keep only the tabs/contexts the snippet opened |
+| `resultMaxBytes` | `--result-max-bytes` (5 MB) | larger results are written to an artifact |
 | `abortGraceMs` | `5000` | after an abort, how long to wait for the snippet to stop before the tab/queue moves on |
 
 ### Response fields
@@ -191,11 +214,23 @@ relevant:
 | `logs` | `[{level, msg, ms}]` the snippet wrote with `console.*` (also on failure). Capped at 500 entries / 64 KB |
 | `logsTruncated` | `true` when the cap was hit |
 | `dialogs` | `[{type, message, action, ms}]` JS dialogs auto-handled during the run |
-| `aborted` | `timeout` or `queue cleared` |
-| `persisted` | what `persist: true` kept: `{listeners, interception, exposed}` |
+| `pageEvents` | `[{type, ..., ms}]` page events requested with `pageEvents` (max 200, then `pageEventsTruncated`) |
+| `errorScreenshot` | `{$binary, data, bytes}` PNG when the run failed and `screenshotOnError` was set |
+| `aborted` / `cancelled` | `timeout` or the cancel reason / `true` when cancelled |
+| `sessionExpired` / `sessionUrl` | the run ended on a URL matching `--login-url-pattern`: the login must be redone |
+| `reconnected` | `{ok, attempts, ms}`: the CDP connection was re-established before this run |
+| `browserRestarted` | Chrome had died and a new one was launched on the profile (session-only cookies and tabs lost) |
+| `tabCrashed` | `{page, url, replaced}`: the named tab had crashed and was replaced before this run |
+| `persisted` / `keptTabs` | what `persist` / `keepTabs` kept |
+| `timeoutCappedTo` | the requested timeout exceeded `--max-timeout` |
 
-`/run` returns only the raw `result`; its `X-Run-Id` header is the run id in
-the execution log, which also holds `logs` and `dialogs`.
+`/run` returns only the raw `result`; its `X-Run-Id` header (also set on the
+other execute routes) is the run id: `GET /runs/:id` returns its code, status,
+`logs`, `dialogs` and `pageEvents`.
+
+**Large results.** A result bigger than `resultMaxBytes` is written to
+`<log dir>/artifacts/` and replaced by
+`{ "$artifact": "<id>", "bytes", "contentType", "url": "/artifacts/<id>", "path" }`.
 
 **Binary results.** Buffers, typed arrays and ArrayBuffers (top-level, or nested
 in plain objects/arrays) come back as
@@ -216,12 +251,34 @@ Each request runs in its own scope:
   and can no longer touch the browser. Not covered: element handles and frames
   the snippet already obtained, and non-browser work (timers, `fetch`). For
   those, check `helpers.signal` / `helpers.checkAborted()`.
-- **Per-run cleanup.** When the run ends, the server removes listeners the
-  snippet added with `page.on/once/addListener` and `browser.on/...`, turns off
-  request interception the snippet turned on, and removes functions it exposed.
-  This stops listeners piling up, and stops a forgotten interception handler
-  from hanging every later request on the tab. Pass `persist: true` to keep them
-  for deliberate multi-call setups.
+- **Per-run cleanup.** When the run ends, the server undoes what the snippet
+  set up on the shared session:
+  - it removes listeners added with `page.on/once/addListener` and `browser.on/...`
+  - it turns off request interception the snippet turned on (a forgotten
+    interception handler would hang every later request on the tab)
+  - it removes exposed functions and `evaluateOnNewDocument` scripts
+  - it restores settings: `setViewport`/`emulate`, `setUserAgent`,
+    `setExtraHTTPHeaders`, `setOfflineMode`, `emulateNetworkConditions`,
+    `setJavaScriptEnabled`, `setCacheEnabled`, `setBypassCSP`,
+    `setBypassServiceWorker`, `emulateMediaType`/`MediaFeatures`/`Timezone`/
+    `CPUThrottling`/`IdleState`/`VisionDeficiency`, `setGeolocation`,
+    `authenticate`, `setDefaultTimeout` (`setDefaultNavigationTimeout` goes back
+    to 30 s)
+  - it closes tabs the snippet opened (`browser.newPage()`, popups opened from
+    the run's page, at any depth) and incognito contexts it created
+
+  Pass `persist: true` to keep all of it for deliberate multi-call setups, or
+  `keepTabs: true` to keep only the tabs. The execution log's `cleanup` field
+  lists what was undone.
+- **Focus.** The sequential page is brought to the front before each run.
+  Headless Chrome doesn't render background tabs, so `page.click()` on one never
+  completes. A snippet that opens a popup and then clicks the original page
+  should call `await page.bringToFront()` first. Concurrent pool tabs can't all
+  be in front at once, so in headless mode prefer `evaluate`-based clicks there.
+- **Crashes.** If a named tab's renderer crashes, the next request replaces it
+  and reports `tabCrashed`. A crashed pool tab is closed instead of being
+  handed out again. If Chrome itself died, the next request launches a new one
+  on the same profile and reports `browserRestarted`.
 - **JS dialogs never freeze a tab.** Every managed page (named pages, the
   adopted `main` tab, pool tabs) has a default dialog handler. If no other
   `dialog` listener is registered, it accepts `alert` and `beforeunload` and
@@ -232,15 +289,49 @@ Each request runs in its own scope:
 
 ### Known limitations
 
-- No streaming: results, logs and events come back when the run ends.
-- No background jobs: a run lives within one request (use `globalThis` or the
-  page to carry state between calls).
+- No streaming within one HTTP response: use async jobs or watches and poll.
 - `require` isn't defined in snippets, so you can't launch or connect a second
   browser. Snippets aren't sandboxed: `await import('fs')`, `process` and
   `fetch` work.
-- Downloads go to Chrome's default folder unless you set
-  `Browser.setDownloadBehavior` through `page.createCDPSession()`.
+- `helpers.download` changes the browser-wide download behaviour while it
+  runs; downloads are serialized.
 - Puppeteer 21.x APIs only.
+
+### Async jobs
+
+Add `"async": true` to any execute route to get `202 { jobId, run, poll, cancel }`
+immediately:
+
+- `GET /jobs/:id` while running: `{status: "running", phase: "queued" |
+  "executing", logs, dialogs, pageEvents}`, i.e. what the run has produced so far.
+- When finished: `status` is `succeeded`, `failed`, `timeout` or `cancelled`,
+  followed by the full execute response (`result`, `error`, `logs`, ...).
+- `POST /jobs/:id/cancel` aborts a running job (it stops at its next browser
+  call) or drops a queued one. A job that has already finished returns `409`.
+- Finished jobs are kept for `--job-ttl-ms` (default 10 min), then return `404`.
+  `GET /jobs` lists them.
+
+### Watches
+
+Observe a page across calls, for example to see what a UI does while you drive
+it in other requests:
+
+```bash
+curl -s -XPOST localhost:8080/watch -H 'content-type: application/json' \
+  -d '{"events": ["console", "pageerror", "httpError", "framenavigated"], "page": "main"}'
+# -> {"watchId": "w1", ...}      ("tabId": "tab-2" watches a pool tab)
+curl -s 'localhost:8080/watch/w1?since=0'
+# -> {"events": [{"seq": 1, "ts": "...", "type": "console", "level": "log", "text": "..."}],
+#     "next": 1, "more": false, "dropped": 0, "closed": false}
+curl -s -XDELETE localhost:8080/watch/w1
+```
+
+Event types: `console`, `pageerror`, `requestfailed`, `httpError` (status ≥
+400), `response`, `request`, `framenavigated` (main frame), `popup`, `dialog`.
+The default is all except `response` and `request`. The buffer keeps the last
+`maxEvents` (default 1000); older events are counted in `dropped`. A watch is
+bound to one tab: `closed: true` once that tab is closed or replaced. Watches
+nobody reads for 30 minutes expire.
 
 ### Example: Fetching JSON from authenticated endpoint
 
@@ -269,6 +360,14 @@ curl -X POST http://localhost:8080/run \
 | GET | `/health` | Health check |
 | POST | `/clear-queue` | Clear pending executions and abort the running one |
 | POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
+| POST | `/ready` | Mark the session ready (user finished logging in), instead of pressing ENTER |
+| GET | `/runs` · `/runs/:id` | Recent runs · one run's code, status, error, logs, dialogs, page events |
+| GET | `/jobs` · `/jobs/:id` | Async jobs · one job's progress or result |
+| POST | `/jobs/:id/cancel` | Cancel an async job |
+| POST | `/watch` | Start watching a page's events (`{events, page \| tabId, maxEvents}`) |
+| GET | `/watch` · `/watch/:id?since=N` | List watches · read events after cursor `N` |
+| DELETE | `/watch/:id` | Stop a watch |
+| GET | `/artifacts/:id` | A large result or download written to disk |
 | POST | `/shutdown` | Stop server and browser |
 
 **Automatic reconnect.** Before running a request, the server pings the browser
@@ -477,7 +576,9 @@ async fetchJson(url) {
 ## Security Considerations
 
 - **Local use only**: Server binds to localhost by default
-- **No authentication**: Anyone with local access can execute code
+- **Optional token**: `--token <t>` (or `$PUPPETEER_SERVER_TOKEN`) makes every
+  request except `GET /health` require `Authorization: Bearer <t>` (or
+  `X-Auth-Token: <t>`). Without it, anyone with local access can execute code
 - **eval() equivalent**: The executor runs arbitrary JavaScript - use responsibly
 - **Session exposure**: Cookies and session state are accessible via API
 
@@ -492,14 +593,24 @@ puppeteer-server/
 │   ├── browser.js        # Browser lifecycle management
 │   ├── executor.js       # Code execution engine
 │   ├── run-scope.js      # Per-run abort, cleanup, console capture, dialog handling
+│   ├── helpers.js        # `helpers` given to snippets (incl. download/files)
+│   ├── page-events.js    # Page event capture (pageEvents, watches)
+│   ├── jobs.js           # Async jobs
+│   ├── watch.js          # Watches (page events across calls)
+│   ├── artifacts.js      # Large results / downloads on disk
 │   ├── tab-pool.js       # Tab pool for concurrent execution
 │   ├── logger.js         # Structured logs + executions JSONL
 │   ├── server.js         # Express HTTP server
 │   └── index.js          # Module exports
 ├── test/
-│   └── integration.test.js # Real server + headless Chrome tests (npm test)
+│   ├── support.js        # Fixture site + server launcher
+│   ├── integration.test.js # Abort, cleanup, dialogs, binaries, console
+│   ├── features.test.js  # Logging, routes, settings/tabs, jobs, watches, files, crashes
+│   └── lifecycle.test.js # Token, /ready, reconnect, Chrome death, server restart
+├── .github/workflows/test.yml # CI: npm test on ubuntu-latest with Chrome
 ├── docs/
-│   └── PLAN-harness-gaps.md
+│   ├── PLAN-harness-gaps.md
+│   └── PLAN-2026-11-09-next-features.md
 └── examples/
     ├── client.js         # Node.js client library
     └── sap-api-example.sh # Shell script example
@@ -511,10 +622,13 @@ puppeteer-server/
 npm test
 ```
 
-Integration tests (`test/integration.test.js`) start the real server headless,
-on a random port with a temp profile and log dir, against a local fixture site.
-They need Google Chrome installed. `KEEP_TEST_LOGS=1 npm test` keeps the server
-logs.
+The integration tests (`test/*.test.js`) start the real server headless, on a
+random port with a temp profile and log dir, against a local fixture site
+(`test/support.js`). They need Google Chrome installed. `KEEP_TEST_LOGS=1 npm
+test` keeps the server logs. The lifecycle tests use
+`PUPPETEER_SERVER_TEST_HOOKS=1`, which enables `POST /__test/drop-connection`
+to simulate a dropped CDP socket; never set it in normal use. CI runs the same
+suite (`.github/workflows/test.yml`).
 
 ## Troubleshooting
 
