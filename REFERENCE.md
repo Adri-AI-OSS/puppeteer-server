@@ -33,15 +33,16 @@ Single-session (sequential) endpoints:
 
 | Method & path | Purpose |
 |---|---|
-| `POST /execute` | Run a Puppeteer snippet. Body: `{ "code": "...", "timeout": 30000 }`. `page`, `browser` are in scope; `return` a JSON-serializable value. |
-| `POST /run` | Like `/execute`, for fire-and-forget scripts. |
+| `POST /execute` | Run a Puppeteer snippet. Body: `{ "code": "...", "timeout": 30000 }` plus options below. Returns `{ success, result \| error, run, ... }`. |
+| `POST /run` | Like `/execute` but returns only the raw `result`; the `X-Run-Id` header links it to the execution log. |
 | `POST /goto` | Navigate. Body: `{ "url": "https://…", "waitUntil": "networkidle2" }`. |
 | `GET /page` | Current URL + title. |
 | `GET /content` | Full rendered HTML of the current page. |
 | `GET /screenshot` | PNG screenshot of the current page. |
 | `GET /cookies` | Cookies for the current context. |
 | `GET /status` · `GET /health` | Server + browser liveness. |
-| `POST /clear-queue` | Drop queued sequential requests. |
+| `POST /reconnect` | Drop and re-establish the CDP connection to the same Chrome (session kept). Rarely needed: requests auto-reconnect. |
+| `POST /clear-queue` | Drop queued sequential requests and abort the one running. |
 | `POST /shutdown` | Close the browser and exit. |
 
 Concurrent tab pool (enable with `--pool`):
@@ -56,12 +57,69 @@ Concurrent tab pool (enable with `--pool`):
 | `GET /pool/status` · `GET /pool/tabs` | Pool occupancy. |
 | `POST /pool/close-all` · `POST /pool/prune` | Reclaim tabs. |
 
+## Writing snippets
+
+The code runs as the body of an async function. In scope:
+
+- `page`: the session's tab (pool routes: the acquired tab). `browser`: the
+  browser; `close()` / `disconnect()` are blocked.
+- `console`: output is returned as `logs`.
+- `helpers`: `wait(ms)`, `waitFor(selector, ms)`, `waitUntil(fn)`,
+  `waitForContent()`, `getText`, `getAttr`, `getAllText`, `exists`, `getJson`,
+  `screenshot`, `getUrl`, `getTitle`, plus `signal` (an AbortSignal) and
+  `checkAborted()` for long loops.
+
+`return` a JSON-serializable value. Buffers (`page.screenshot()`, `page.pdf()`)
+and typed arrays come back as `{ "$binary": "base64", "data": "…", "bytes": n }`.
+
+Request options (all execute routes): `timeout` (ms, default 30000),
+`returnType` (`auto` | `text` | `none`), `pageName` (sequential routes, default
+`main`), `persist` (see below), `abortGraceMs` (default 5000).
+
+Response extras, present only when relevant:
+
+| field | meaning |
+|---|---|
+| `logs` | `[{level, msg, ms}]` from `console.*`, also on failure. Capped at 500 lines / 64 KB (`logsTruncated: true`) |
+| `dialogs` | JS dialogs auto-handled during the run: `[{type, message, action, ms}]` |
+| `aborted` | `"timeout"` or `"queue cleared"` |
+| `persisted` | what `persist: true` kept |
+
+Behaviour to rely on:
+
+- **Timeouts stop the snippet.** After `timeout`, any further `page`/`browser`/
+  `helpers` call from it throws `RunAbortedError`, so it can't interfere with
+  the next request. Split long flows into several calls rather than raising the
+  timeout a lot.
+- **Each call starts clean.** Listeners (`page.on(...)`), request interception
+  and `exposeFunction` set up by a snippet are removed when the call ends. Pass
+  `"persist": true` to keep them across calls. Use `globalThis` or the page
+  itself to carry data between calls.
+- **Dialogs don't block.** Unless your snippet registers
+  `page.on('dialog', ...)`, the server accepts `alert`/`beforeunload` and
+  dismisses `confirm`/`prompt`, and reports them in `dialogs`.
+- **Lost browser connection.** If the CDP connection to Chrome drops, the next
+  request reconnects to the same Chrome (3 attempts) before running, so the
+  login survives. No `/reconnect` call is needed.
+- **Not available:** streaming or progress output, background jobs, `require`
+  (so you can't launch a second browser). Downloads need
+  `page.createCDPSession()` + `Browser.setDownloadBehavior`.
+
+Every call's full code, outcome, logs and dialogs are written to
+`logs/puppeteer-server_<port>_latest.executions.jsonl`, keyed by `run`.
+
 ## Example
 
 ```bash
 # After launch + login:
 curl -s localhost:3000/execute -H 'content-type: application/json' -d '{
   "code": "await page.goto(\"https://api.sap.com\"); return await page.title();"
+}'
+
+# Answer a confirm() yourself, capture console output, keep a 60s budget:
+curl -s localhost:3000/execute -H 'content-type: application/json' -d '{
+  "timeout": 60000,
+  "code": "page.on(\"dialog\", d => d.accept()); await page.click(\"#delete\"); console.log(\"clicked\"); return page.url();"
 }'
 ```
 

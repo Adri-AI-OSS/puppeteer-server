@@ -259,7 +259,7 @@ curl -X POST http://localhost:8080/run \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/execute` | Execute code, return full result with metadata |
-| POST | `/run` | Execute code, return raw result only |
+| POST | `/run` | Execute code, return raw result only (`X-Run-Id` header = run id) |
 | POST | `/goto` | Navigate to URL |
 | GET | `/page` | Get current URL and title |
 | GET | `/content` | Get page HTML |
@@ -267,7 +267,7 @@ curl -X POST http://localhost:8080/run \
 | GET | `/cookies` | Get session cookies |
 | GET | `/status` | Get queue status |
 | GET | `/health` | Health check |
-| POST | `/clear-queue` | Clear pending executions |
+| POST | `/clear-queue` | Clear pending executions and abort the running one |
 | POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
 | POST | `/shutdown` | Stop server and browser |
 
