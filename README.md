@@ -64,9 +64,9 @@ This allows any external tool (curl, scripts, AI assistants) to control the brow
 
 ### 2. Code Executor (`lib/executor.js`)
 - Executes JavaScript code strings using `AsyncFunction`
-- Provides `page`, `browser`, and `helpers` objects to executed code
+- Provides `page`, `browser`, `helpers` and `console` objects to executed code
 - Queues requests to prevent race conditions
-- Includes timeout protection
+- Aborts runs on timeout, cleans up per-run page state, returns console output (`lib/run-scope.js`)
 
 ### 3. HTTP Server (`lib/server.js`)
 - Express server with REST endpoints
@@ -134,10 +134,13 @@ curl http://localhost:8080/screenshot > screenshot.png
 
 When you send code to `/run` or `/execute`, these objects are available:
 
-- **`page`** - Puppeteer Page object (current tab)
-- **`browser`** - Puppeteer Browser object
+- **`page`** - Puppeteer Page object (current tab), wrapped per run (see [Run lifecycle](#run-lifecycle))
+- **`browser`** - Puppeteer Browser object, wrapped per run; `close()`/`disconnect()` are blocked
+- **`console`** - captured per run and returned as `logs` (see below)
 - **`helpers`** - Utility functions:
-  - `helpers.wait(ms)` - Wait for specified milliseconds
+  - `helpers.signal` - `AbortSignal` that fires when the run times out or is cancelled
+  - `helpers.checkAborted()` - throw if the run was aborted (use it in long loops)
+  - `helpers.wait(ms)` - Wait for specified milliseconds (rejects if the run is aborted)
   - `helpers.waitUntil(conditionFn, maxWaitMs, pollIntervalMs)` - Poll until condition is true
   - `helpers.waitForContent(options)` - Smart wait for page content (see below)
   - `helpers.getText(selector)` - Get text content of element
@@ -163,6 +166,81 @@ await helpers.waitForContent({
     noLoadingText: true     // Wait until "Loading" text disappears (default: true)
 });
 ```
+
+### Request options
+
+`/execute`, `/run`, `/pool/execute` and `/pool/tab/:id/execute` accept a JSON
+body `{ code, ...options }`:
+
+| option | default | meaning |
+|---|---|---|
+| `timeout` | `30000` | ms before the run is aborted |
+| `returnType` | `auto` | `auto`/`json`, `text` or `none` |
+| `pageName` | `main` | named page for the sequential endpoints |
+| `persist` | `false` | keep listeners, request interception and exposed functions the snippet set up (see below) |
+| `abortGraceMs` | `5000` | after an abort, how long to wait for the snippet to stop before the tab/queue moves on |
+
+### Response fields
+
+`/execute` and the pool execute routes return
+`{ success, result | error, stack, run, duration, tabId? }` plus, only when
+relevant:
+
+| field | meaning |
+|---|---|
+| `logs` | `[{level, msg, ms}]` the snippet wrote with `console.*` (also on failure). Capped at 500 entries / 64 KB |
+| `logsTruncated` | `true` when the cap was hit |
+| `dialogs` | `[{type, message, action, ms}]` JS dialogs auto-handled during the run |
+| `aborted` | `timeout` or `queue cleared` |
+| `persisted` | what `persist: true` kept: `{listeners, interception, exposed}` |
+
+`/run` returns only the raw `result`; its `X-Run-Id` header is the run id in
+the execution log, which also holds `logs` and `dialogs`.
+
+**Binary results.** Buffers, typed arrays and ArrayBuffers (top-level, or nested
+in plain objects/arrays) come back as
+`{ "$binary": "base64", "data": "<base64>", "bytes": n }`, e.g.
+`return page.screenshot()` or `return { pdf: await page.pdf() }`.
+
+### Run lifecycle
+
+Each request runs in its own scope:
+
+- **Timeouts abort the run.** JavaScript can't be killed, so on timeout (or
+  `POST /clear-queue`, which aborts the running sequential run) every later call
+  the snippet makes through `page`, `page.keyboard/mouse/touchscreen`,
+  `browser` or `helpers` throws `RunAbortedError`. So does any such call that
+  was already in flight, once it returns. The server waits up to `abortGraceMs`
+  for the snippet to stop before the next queued run (or the next pool user)
+  gets the tab. A snippet that keeps going past that is logged as an `orphan`
+  and can no longer touch the browser. Not covered: element handles and frames
+  the snippet already obtained, and non-browser work (timers, `fetch`). For
+  those, check `helpers.signal` / `helpers.checkAborted()`.
+- **Per-run cleanup.** When the run ends, the server removes listeners the
+  snippet added with `page.on/once/addListener` and `browser.on/...`, turns off
+  request interception the snippet turned on, and removes functions it exposed.
+  This stops listeners piling up, and stops a forgotten interception handler
+  from hanging every later request on the tab. Pass `persist: true` to keep them
+  for deliberate multi-call setups.
+- **JS dialogs never freeze a tab.** Every managed page (named pages, the
+  adopted `main` tab, pool tabs) has a default dialog handler. If no other
+  `dialog` listener is registered, it accepts `alert` and `beforeunload` and
+  dismisses `confirm` and `prompt`. Each handled dialog is logged and, if it
+  happened during a run, reported in that run's `dialogs`. To answer a dialog
+  yourself, register `page.on('dialog', d => d.accept(...))` in the snippet, and
+  the default handler stays out of it.
+
+### Known limitations
+
+- No streaming: results, logs and events come back when the run ends.
+- No background jobs: a run lives within one request (use `globalThis` or the
+  page to carry state between calls).
+- `require` isn't defined in snippets, so you can't launch or connect a second
+  browser. Snippets aren't sandboxed: `await import('fs')`, `process` and
+  `fetch` work.
+- Downloads go to Chrome's default folder unless you set
+  `Browser.setDownloadBehavior` through `page.createCDPSession()`.
+- Puppeteer 21.x APIs only.
 
 ### Example: Fetching JSON from authenticated endpoint
 
@@ -238,7 +316,7 @@ routes) writes these records:
 |---|---|---|
 | `start` | when the request reaches the executor, **before** queueing, page lookup or launch | `run`, `req`, `method`, `path`, `mode`, `page`/`tabId`, `timeoutMs`, the **full `code`** |
 | `exec` | right before the code runs | page `url`, `queuedMs` / `acquireMs` |
-| `end` | exactly once, whatever the outcome | `status` (`ok`, `error`, `timeout` or `cancelled`), `ms`, and on failure `error`, `stack`, `stage` (`getPage`, `acquireTab`, `lookupTab`, `run` or `serialize`); on success `resultType` and `resultBytes` |
+| `end` | exactly once, whatever the outcome | `status` (`ok`, `error`, `timeout` or `cancelled`), `ms`, and on failure `error`, `stack`, `stage` (`getPage`, `acquireTab`, `lookupTab`, `run` or `serialize`); on success `resultType` and `resultBytes`; when relevant `logs`, `logsTruncated`, `dialogs`, `aborted`, `settledAfterAbortMs`, `orphan`, `cleanup` |
 
 The `start` record is written to disk before anything else happens. A run that
 hangs or crashes the server still has its code on record: it's the `start`
@@ -413,12 +491,30 @@ puppeteer-server/
 ├── lib/
 │   ├── browser.js        # Browser lifecycle management
 │   ├── executor.js       # Code execution engine
+│   ├── run-scope.js      # Per-run abort, cleanup, console capture, dialog handling
+│   ├── tab-pool.js       # Tab pool for concurrent execution
+│   ├── logger.js         # Structured logs + executions JSONL
 │   ├── server.js         # Express HTTP server
 │   └── index.js          # Module exports
+├── test/
+│   └── integration.test.js # Real server + headless Chrome tests (npm test)
+├── docs/
+│   └── PLAN-harness-gaps.md
 └── examples/
     ├── client.js         # Node.js client library
     └── sap-api-example.sh # Shell script example
 ```
+
+## Tests
+
+```bash
+npm test
+```
+
+Integration tests (`test/integration.test.js`) start the real server headless,
+on a random port with a temp profile and log dir, against a local fixture site.
+They need Google Chrome installed. `KEEP_TEST_LOGS=1 npm test` keeps the server
+logs.
 
 ## Troubleshooting
 
