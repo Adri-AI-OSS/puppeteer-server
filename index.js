@@ -18,6 +18,9 @@
  *   --max-tabs       Maximum tabs in pool (default: 10)
  *   --log-dir        Directory for log files (default: <repo>/logs)
  *   --log-level      debug | info | warn | error (default: info)
+ *   --token          Require `Authorization: Bearer <token>` (or $PUPPETEER_SERVER_TOKEN)
+ *   --login-url-pattern  Regex: a run ending on a matching URL => sessionExpired
+ *   --max-queue, --max-timeout, --result-max-bytes, --job-ttl-ms, --acquire-timeout
  *
  * Examples:
  *   node index.js
@@ -52,7 +55,22 @@ function parseArgs(args) {
         maxTabs: 10,
         noPrompt: false,  // Skip "Press ENTER" prompt for autonomous operation
         logDir: process.env.PUPPETEER_SERVER_LOG_DIR || log.DEFAULT_LOG_DIR,
-        logLevel: process.env.LOG_LEVEL || 'info'
+        logLevel: process.env.LOG_LEVEL || 'info',
+        token: process.env.PUPPETEER_SERVER_TOKEN || null,
+        loginUrlPattern: process.env.PUPPETEER_SERVER_LOGIN_URL_PATTERN || null,
+        maxQueue: undefined,
+        maxTimeoutMs: undefined,
+        resultMaxBytes: undefined,
+        jobTtlMs: undefined,
+        acquireTimeoutMs: undefined
+    };
+    const num = (v, flag) => {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n <= 0) {
+            console.error(`${flag} expects a positive number, got: ${v}`);
+            process.exit(2);
+        }
+        return n;
     };
 
     const positional = [];
@@ -97,6 +115,34 @@ function parseArgs(args) {
                 break;
             case '--log-level':
                 options.logLevel = next;
+                i++;
+                break;
+            case '--token':
+                options.token = next;
+                i++;
+                break;
+            case '--login-url-pattern':
+                options.loginUrlPattern = next;
+                i++;
+                break;
+            case '--max-queue':
+                options.maxQueue = num(next, arg);
+                i++;
+                break;
+            case '--max-timeout':
+                options.maxTimeoutMs = num(next, arg);
+                i++;
+                break;
+            case '--result-max-bytes':
+                options.resultMaxBytes = num(next, arg);
+                i++;
+                break;
+            case '--job-ttl-ms':
+                options.jobTtlMs = num(next, arg);
+                i++;
+                break;
+            case '--acquire-timeout':
+                options.acquireTimeoutMs = num(next, arg);
                 i++;
                 break;
             case '--help':
@@ -149,6 +195,17 @@ Options:
                          puppeteer-server_<port>_<UTC ts>.log and updates the
                          puppeteer-server_<port>_latest.log symlink.
   --log-level <level>    debug | info | warn | error (default: info, or $LOG_LEVEL)
+  --token <token>        Require "Authorization: Bearer <token>" on every request
+                         except GET /health (or $PUPPETEER_SERVER_TOKEN)
+  --login-url-pattern <regex>
+                         A run that ends on a matching URL is reported as
+                         sessionExpired: true (login needs redoing)
+  --max-queue <n>        Sequential queue length before 429 (default: 50)
+  --max-timeout <ms>     Cap on a request's timeout (default: 600000)
+  --result-max-bytes <n> Results larger than this are written to an artifact
+                         (GET /artifacts/:id) (default: 5242880)
+  --job-ttl-ms <ms>      Keep finished async jobs this long (default: 600000)
+  --acquire-timeout <ms> Pool: wait this long for a free tab (default: 30000)
   --help, -h             Show this help message
 
 Examples:
@@ -165,7 +222,14 @@ API Endpoints (Legacy - Sequential):
   GET  /screenshot       Take screenshot (PNG)
   GET  /cookies          Get page cookies
   GET  /status           Get queue status
-  POST /clear-queue      Clear pending executions
+  POST /clear-queue      Clear pending executions and abort the running one
+  POST /reconnect        Re-attach to the running Chrome
+  POST /ready            Mark the session ready (instead of pressing ENTER)
+  GET  /runs[/:id]       Recent runs / one run's code, status, logs, dialogs
+  GET  /jobs/:id         Async job status (start with "async": true)
+  POST /jobs/:id/cancel  Cancel an async job
+  POST /watch            Watch page events across calls (GET/DELETE /watch/:id)
+  GET  /artifacts/:id    Large results and downloads
   POST /shutdown         Shutdown server and browser
   GET  /health           Health check
 
@@ -230,12 +294,21 @@ function askQuestion(question) {
         input: process.stdin,
         output: process.stdout
     });
-    return new Promise(resolve => {
-        rl.question(question, answer => {
-            rl.close();
-            resolve(answer);
+    let closed = false;
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        rl.close();
+    };
+    const answer = new Promise(resolve => {
+        rl.question(question, a => {
+            close();
+            resolve(a);
         });
+        // stdin ended (e.g. not a TTY): wait for POST /ready instead.
+        rl.on('close', () => { if (!closed) closed = true; });
     });
+    return { answer, close };
 }
 
 /**
@@ -304,14 +377,22 @@ async function main() {
     if (options.enablePool) {
         console.log(`Initializing tab pool (max ${options.maxTabs} tabs)...`);
         tabPoolManager = new TabPoolManager(browserManager, {
-            maxTabs: options.maxTabs
+            maxTabs: options.maxTabs,
+            acquireTimeoutMs: options.acquireTimeoutMs
         });
     }
 
-    const executor = new CodeExecutor(browserManager, tabPoolManager);
+    const executor = new CodeExecutor(browserManager, tabPoolManager, {
+        maxQueue: options.maxQueue,
+        maxTimeoutMs: options.maxTimeoutMs,
+        resultMaxBytes: options.resultMaxBytes,
+        loginUrlPattern: options.loginUrlPattern
+    });
     const server = new Server(executor, browserManager, {
         port: options.port,
-        tabPoolManager
+        tabPoolManager,
+        token: options.token,
+        jobTtlMs: options.jobTtlMs
     });
 
     // Reserve the port FIRST — app.listen is the only race-free reservation.
@@ -376,11 +457,19 @@ async function main() {
         console.log();
         console.log('-'.repeat(60));
         console.log('Browser is open. Please log in if authentication is required.');
+        console.log(`(Or, from another process: POST http://localhost:${options.port}/ready)`);
         console.log('-'.repeat(60));
-        await askQuestion('Press ENTER when the session is ready...');
+        const question = askQuestion('Press ENTER when the session is ready...');
+        const source = await Promise.race([
+            question.answer.then(() => 'terminal (ENTER)'),
+            server.whenReady()
+        ]);
+        question.close();
+        server.markReady(source);
     } else {
         console.log();
         console.log('--no-prompt mode: session ready immediately...');
+        server.markReady('--no-prompt');
     }
 
     console.log();
