@@ -190,7 +190,81 @@ curl -X POST http://localhost:8080/run \
 | GET | `/status` | Get queue status |
 | GET | `/health` | Health check |
 | POST | `/clear-queue` | Clear pending executions |
+| POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
 | POST | `/shutdown` | Stop server and browser |
+
+**Automatic reconnect.** Before running a request, the server pings the browser
+it's connected to, with a 3 s limit. If the connection is gone, or open but not
+responding (for example after the laptop sleeps or Chrome freezes), the server
+reconnects *before* running the request, so the caller doesn't need to call
+`/reconnect`:
+
+1. It makes up to 3 attempts, waiting 250 ms and then 500 ms between them. Each
+   attempt tries the endpoint it was last connected to, then the profile's
+   `DevToolsActivePort` file.
+2. A successful attempt reuses the existing logged-in tab as `main`, and the
+   request continues.
+3. If every attempt fails, or the Chrome this server launched has exited, it
+   launches a new Chrome.
+
+The outcome (`ok`, number of attempts, time taken, endpoint) is logged with the
+request and saved on the run's `exec` record in the executions JSONL. Stale
+pool tabs left over from the old connection are dropped automatically.
+Executed code can't call `browser.disconnect()` or `browser.close()`, because
+the connection is shared by every request.
+
+### Logs
+
+Every run writes `logs/puppeteer-server_<port>_<UTC ts>.log` (in the repo,
+regardless of cwd) and points `logs/puppeteer-server_<port>_latest.log` at it.
+This is the same convention as adri-agents' `dev-scripts`. The file captures
+everything printed to stdout and stderr. Override the location with
+`--log-dir <dir>` or `PUPPETEER_SERVER_LOG_DIR`, and the verbosity with
+`--log-level debug|info|warn|error` or `LOG_LEVEL`.
+
+Each line is `[ISO time] LEVEL [scope] message key=value…`. Lines written while
+handling a request carry the same `req=` id, which is also returned in the
+`X-Request-Id` response header. Log lines are written straight to disk, so they
+survive a crash.
+
+**Full code goes in a separate file.** Each run also writes
+`puppeteer-server_<port>_<ts>.executions.jsonl` (plus a
+`_latest.executions.jsonl` symlink). The text log only shows a short preview of
+the code alongside `run=` and `req=` ids. Every code execution (from `/execute`,
+`/run`, `/goto`, `/page`, `/content`, `/screenshot`, `/cookies` or the pool
+routes) writes these records:
+
+| event | when | contents |
+|---|---|---|
+| `start` | when the request reaches the executor, **before** queueing, page lookup or launch | `run`, `req`, `method`, `path`, `mode`, `page`/`tabId`, `timeoutMs`, the **full `code`** |
+| `exec` | right before the code runs | page `url`, `queuedMs` / `acquireMs` |
+| `end` | exactly once, whatever the outcome | `status` (`ok`, `error`, `timeout` or `cancelled`), `ms`, and on failure `error`, `stack`, `stage` (`getPage`, `acquireTab`, `lookupTab`, `run` or `serialize`); on success `resultType` and `resultBytes` |
+
+The `start` record is written to disk before anything else happens. A run that
+hangs or crashes the server still has its code on record: it's the `start`
+with no matching `end`. API responses include `run`.
+
+```bash
+J=logs/puppeteer-server_8080_latest.executions.jsonl
+grep '"req":"r42"' $J                                  # code and outcome for one request
+jq -r 'select(.run==17 and .event=="start") | .code' $J # the exact code of run 17
+jq -c 'select(.event=="end" and .status!="ok") | {run,req,status,stage,error}' $J
+```
+
+Useful greps on the text log:
+
+```bash
+tail -f logs/puppeteer-server_8080_latest.log
+grep 'req=r42' logs/puppeteer-server_8080_latest.log                    # one request end to end
+grep -E '\[browser\]|\[cdp\]' logs/puppeteer-server_8080_latest.log     # connection lifecycle
+grep 'CDP disconnected' logs/puppeteer-server_8080_latest.log           # why the connection dropped
+```
+
+When the connection drops unexpectedly, the server logs the WebSocket close
+code and meaning, the last socket error, the message counts and largest message
+size, which snippet was running, whether Chrome's PID and DevTools endpoint are
+still alive, and a diagnosis. System sleep and event-loop stalls show up as
+`clock jumped` warnings.
 
 ### Pool Endpoints (Concurrent Execution)
 
