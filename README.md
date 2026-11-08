@@ -193,10 +193,25 @@ curl -X POST http://localhost:8080/run \
 | POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
 | POST | `/shutdown` | Stop server and browser |
 
-If the CDP connection to Chrome drops while Chrome keeps running, the next
-request re-attaches to it via the profile's `DevToolsActivePort` file, so the
-logged-in session survives. Executed code can't call `browser.disconnect()` or
-`browser.close()`, because the connection is shared by every request.
+**Automatic reconnect.** Before running a request, the server pings the browser
+it's connected to, with a 3 s limit. If the connection is gone, or open but not
+responding (for example after the laptop sleeps or Chrome freezes), the server
+reconnects *before* running the request, so the caller doesn't need to call
+`/reconnect`:
+
+1. It makes up to 3 attempts, waiting 250 ms and then 500 ms between them. Each
+   attempt tries the endpoint it was last connected to, then the profile's
+   `DevToolsActivePort` file.
+2. A successful attempt reuses the existing logged-in tab as `main`, and the
+   request continues.
+3. If every attempt fails, or the Chrome this server launched has exited, it
+   launches a new Chrome.
+
+The outcome (`ok`, number of attempts, time taken, endpoint) is logged with the
+request and saved on the run's `exec` record in the executions JSONL. Stale
+pool tabs left over from the old connection are dropped automatically.
+Executed code can't call `browser.disconnect()` or `browser.close()`, because
+the connection is shared by every request.
 
 ### Logs
 
