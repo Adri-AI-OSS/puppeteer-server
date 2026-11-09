@@ -172,6 +172,23 @@ Headful was not measured at first. It was verified after implementation (live ru
 | server SIGKILL + restart: tab re-adopted, Chrome page count | same URL, 8 → 8 | same URL, 8 → 8 |
 | parallel navigations on two tabs (local 2 s endpoint) | 2.04 s wall for 2 × 2 s | — |
 
+A second live run (headless, real sites) covered the rest of the design. 31 checks passed:
+
+- **T2:** `POST /tabs {name, url}` on github.com, plus 409 on a duplicate and 400 on a bad name. `GET /tabs/:name`, auto-create with `tabCreated`, `/goto` with a tab, and `/page`, `/content`, `/screenshot` and `/cookies` with `?tab=` on httpbin and github. A watch on one tab, a busy tab refusing `DELETE` (409), `/clear-queue?tab=`, and `DELETE /tabs/main` returning 409.
+- **T1:** per-tab 429 while another tab keeps working, `tab: "new"` on a live site and then closed, 503 at the limit after the acquire timeout, and 409 with the idle tabs from `POST /tabs`.
+- **T3:** `/pool/execute`, `/pool/acquire` plus `/pool/tab/:id/execute`, a released pool tab reused by `tab: "new"`, the `pageName` alias, and `/pool/close-all`.
+- **T4:** after Chrome was killed, the next run reported `browserRestarted` and worked on a live site. The old tab was listed as `lost` and recreated on next use.
+- **Expiry and tabs mode:** idle agent tabs expired and `main` was kept. In `--tabs-as tabs` mode all tabs shared one window.
+
+Parallelism and the window choice, on live sites:
+
+| `--tabs-as` | 2 tabs, distinct URLs (httpbin delay/2) | 2 tabs, same URL | 2 loads, one tab | overlapping clicks on 3 tabs |
+|---|---|---|---|---|
+| `windows` | 2.33 s | 5.11 s | 4.52 s | 3/3 ok |
+| `tabs` | 2.31 s | 4.99 s | 4.52 s | 2 of 3 hung |
+
+Chrome serializes concurrent requests for the *same* URL (its HTTP cache lets one writer at a time), so parallel tabs only overlap on distinct URLs. That is Chrome, not the server's queues.
+
 ## Decisions on the open questions
 
 These are the defaults as implemented; each is easy to change.

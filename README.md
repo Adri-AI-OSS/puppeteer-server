@@ -467,6 +467,9 @@ Every page the server drives is a **tab with a name**:
   for a logged-out view or a second account.
 - **One window each.** Every tab except `main` opens in its own window, so
   clicks work on all of them at once (`--tabs-as tabs` to opt out).
+- **Same URL, same time.** Chrome serializes concurrent requests for the exact
+  same URL (HTTP cache lock), so two tabs loading the same URL take as long as
+  one tab loading it twice. Distinct URLs load in parallel.
 - **Names survive.** `{name → Chrome target id}` is kept in
   `<profile>/puppeteer-server-tabs.json`. After a reconnect or a server restart
   every named tab is re-adopted. If Chrome itself died, the old tabs are listed
