@@ -191,9 +191,7 @@ describe('T1 queues and limits', () => {
 // ── T5: one window per tab ──────────────────────────────────────────────────
 
 describe('T5 windows', () => {
-    const windowId = `const s = await browser.target().createCDPSession();
-        const { windowId } = await s.send('Browser.getWindowForTarget', { targetId: page.target()._targetId });
-        await s.detach();
+    const windowId = `const { windowId } = await helpers.cdp('Browser.getWindowForTarget', { targetId: page.target()._targetId });
         return windowId;`;
 
     test('each agent tab has its own window', async () => {
@@ -210,6 +208,26 @@ describe('T5 windows', () => {
             exec(`await page.click('#b'); await page.click('#b'); return '${tab}';`, { tab, timeout: 8000 })));
         assert.deepEqual(runs.map(r => r.success ? r.result : r.error), ['w1', 'w2', 'w3']);
         await closeAllAgentTabs();
+    });
+});
+
+// ── regression: detached browser-target sessions ────────────────────────────
+
+describe('browser-level CDP without the browser target', () => {
+    test('windows, throwaway tabs and helpers.cdp keep working after snippets detach browser sessions', async () => {
+        // On some Chrome builds (seen on Linux CI) detaching a browser-target
+        // session makes Puppeteer 21 drop the browser target. The server must
+        // not depend on browser.target().
+        await exec(`for (let i = 0; i < 5; i++) {
+            try { const c = await browser.target().createCDPSession(); await c.detach(); } catch { /* already gone */ }
+        } return 1`);
+        const n = await exec('return page.url()', { tab: 'new' });
+        assert.equal(n.success, true, J(n));
+        const w = await exec(`const { windowId } = await helpers.cdp('Browser.getWindowForTarget',
+            { targetId: page.target()._targetId }); return windowId;`, { tab: 'after-detach' });
+        assert.equal(typeof w.result, 'number', J(w));
+        assert.equal((await exec('return (await helpers.cdp("Browser.getVersion")).product.length > 0')).result, true);
+        await srv.del('/tabs/after-detach');
     });
 });
 
@@ -238,8 +256,7 @@ describe('expiry and tabs mode', () => {
     test('idle agent tabs expire; main never does; --tabs-as tabs shares a window', async () => {
         const s = await startServer({ pool: false, args: ['--tab-idle-ttl', '2000', '--tabs-as', 'tabs'] });
         try {
-            const windowId = `const c = await browser.target().createCDPSession();
-                const { windowId } = await c.send('Browser.getWindowForTarget', { targetId: page.target()._targetId });
+            const windowId = `const { windowId } = await helpers.cdp('Browser.getWindowForTarget', { targetId: page.target()._targetId });
                 return windowId;`;
             const a = await s.exec(windowId, { tab: 'a' });
             const b = await s.exec(windowId, { tab: 'b' });
