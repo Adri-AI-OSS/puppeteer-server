@@ -37,9 +37,10 @@ created on first use (`tabCreated: true` in the response) and shares the login.
 
 - Runs on the same tab run one after another; runs on different tabs run **in
   parallel**. To work alongside other agents, use your own tab name.
-- Each tab (except `main`) has its own window, so clicks work in parallel.
+- Each tab (except `main`) has its own window, so clicks work in parallel
+  (`--tabs-as tabs` puts them in one window; then only the front tab can click).
 - Tab names survive reconnects and server restarts. Idle agent tabs close after
-  30 minutes; `main` never does.
+  30 minutes (`--tab-idle-ttl <ms>`); `main` never does.
 - `"isolated": true` on `POST /tabs` gives a tab with its own cookies (a
   logged-out view or a second account).
 
