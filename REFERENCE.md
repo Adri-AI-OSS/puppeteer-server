@@ -93,6 +93,9 @@ The code runs as the body of an async function. In scope:
     `inlineMaxBytes` (default 5 MB) come back as `artifact` instead of `data`.
   - `helpers.files.<name>`: local paths of files sent with the request, for
     `elementHandle.uploadFile(...)`.
+  - `helpers.cdp(method, params)`: browser-level DevTools commands
+    (`Browser.*`, `Target.*`). Don't use `browser.target().createCDPSession()`:
+    detaching it can break `browser.target()` for later requests.
 
 `return` a JSON-serializable value. Buffers (`page.screenshot()`, `page.pdf()`)
 and typed arrays come back as `{ "$binary": "base64", "data": "…", "bytes": n }`.

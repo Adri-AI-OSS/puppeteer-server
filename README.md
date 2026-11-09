@@ -171,6 +171,11 @@ When you send code to `/run` or `/execute`, these objects are available:
     `inlineMaxBytes` (default 5 MB) return `artifact` instead of `data`
   - `helpers.files` - `{name: localPath}` for files sent with the request
     (`files` option), for `elementHandle.uploadFile(...)`
+  - `helpers.cdp(method, params)` - send a browser-level DevTools command
+    (`Browser.*`, `Target.*`, ...). Use it instead of
+    `browser.target().createCDPSession()`: with Puppeteer 21, detaching such a
+    session can make Puppeteer lose the browser target (`Browser target is not
+    found`) for every later request
 
 #### Smart Wait for Dynamic Content
 
