@@ -1,6 +1,8 @@
 # Design (2026-11-10): one tab model — named tabs
 
-Status: proposed.
+Status: **implemented** (`lib/tabs.js`). All existing 59 tests pass unchanged;
+`test/tabs.test.js` adds 15 tests. Also live-tested against real sites in
+headless and headful mode (see [Evidence](#evidence)).
 
 ## Problem
 
@@ -69,7 +71,8 @@ Rules:
 
 ### Queues and limits
 - Per tab: a FIFO queue capped at `--max-queue` per tab (429 when full).
-- Global: at most `--max-tabs` open tabs (main + agent + ephemeral). When creating one more would exceed it:
+- Global: at most `--max-tabs` open tabs **besides `main`** (agent + pool + ephemeral). This
+  keeps `--max-tabs` meaning what it meant for the pool. When creating one more would exceed it:
   - `tab: "new"` waits for a slot up to `--acquire-timeout`, then returns 503, as the pool does today.
   - `POST /tabs` returns 409 with the list of idle tabs, so the agent can close one.
 - `/clear-queue` gets `?tab=`. Without it, it clears every tab's queue (today's behaviour, widened to all tabs).
@@ -123,29 +126,29 @@ Behaviour that does change:
 
 ## Implementation plan
 
-- [ ] **T1 Tab registry** (`lib/tabs.js`):
+- [x] **T1 Tab registry** (`lib/tabs.js`):
       - name rules, kinds, per-tab FIFO queue, create/get/list/close, idle expiry
       - replaces `BrowserManager.pages` and `TabPoolManager`
       - the executor's sequential path becomes "enqueue on tab"
       - *Tests:* two tabs run concurrently while one tab serializes; per-tab 429; `--max-tabs` with `tab: "new"` → 503 after the acquire timeout; idle expiry closes agent tabs but never `main`.
-- [ ] **T2 API:**
+- [x] **T2 API:**
       - `tab` option; `GET/POST/DELETE /tabs`
       - `?tab=` on the fixed-purpose routes and `/clear-queue`, plus `tab` on `/watch`
       - `tabCreated` and `tab` in responses
       - *Tests:* auto-create with `tabCreated`; 409 on duplicate `POST /tabs` and on deleting `main` or a busy tab; `/screenshot?tab=` returns that tab's image; a watch on a named tab.
-- [ ] **T3 Aliases:**
+- [x] **T3 Aliases:**
       - `pageName` and every `/pool/*` route mapped onto tabs
       - *Tests:* the existing 59 tests, unchanged.
-- [ ] **T4 Persistence:**
+- [x] **T4 Persistence:**
       - registry file and re-adoption on attach; reset on relaunch; `lost` reporting
       - *Tests:* create `crm`, navigate, drop the CDP connection → same `crm` tab (same URL and cookies); SIGKILL the server and restart → `crm` re-adopted with no extra tab in Chrome; kill Chrome → registry reset and `browserRestarted`.
-- [ ] **T5 One window per tab:**
+- [x] **T5 One window per tab:**
       - `Target.createTarget({ newWindow: true })`; `--tabs-as`
       - *Tests:* three tabs clicking concurrently in headless mode all complete (today two hang).
-- [ ] **T6 Isolated tabs:**
+- [x] **T6 Isolated tabs:**
       - `isolated: true` → own incognito context, closed with the tab
       - *Tests:* a cookie set in `main` is not visible in an isolated tab, and vice versa.
-- [ ] **T7 Docs:** README and REFERENCE rewritten around tabs, plus the deprecated-alias table.
+- [x] **T7 Docs:** README and REFERENCE rewritten around tabs, plus the deprecated-alias table.
 
 Order: T1 → T2 → T3 (old tests stay green) → T5 → T4 → T6 → T7.
 
@@ -158,10 +161,21 @@ Concurrent `page.click()` on three pages, Chrome 157, Puppeteer 21.11, measured 
 | `true` (old) | 2 of 3 hang | 3 of 3 ok |
 | `'new'` | 2 of 3 hang | 3 of 3 ok |
 
-Headful was not measured, because it would open windows on the user's screen. Chrome's occluded-window throttling is already off (`--disable-backgrounding-occluded-windows` is in Puppeteer's default flags), so windows are expected to behave there too. Verify during T5.
+Headful was not measured at first. It was verified after implementation (live run, 2026-11-10) against real sites on the implemented server, in both headless and headful mode:
 
-## Open questions
+| Check | headless | headful |
+|---|---|---|
+| 3 concurrent real clicks (example.com → iana.org), one tab each | 3/3 ok, 1.06 s | 3/3 ok, 1.11 s |
+| `main` + 3 agent tabs → distinct window ids | 4 distinct | 4 distinct |
+| cookie set in `main` (httpbin) visible in an `isolated` tab | no | no |
+| named tab after a dropped CDP connection | same URL, `reconnected` | same URL, `reconnected` |
+| server SIGKILL + restart: tab re-adopted, Chrome page count | same URL, 8 → 8 | same URL, 8 → 8 |
+| parallel navigations on two tabs (local 2 s endpoint) | 2.04 s wall for 2 × 2 s | — |
 
-1. **Headful clutter.** Every agent tab is a new window on the user's screen. Should the default stay `windows` in headful mode, or use `tabs` there (where background tabs aren't rendered either, so clicks have the same issue)?
-2. **Registry location.** Should it live in the profile dir (follows the Chrome it describes) or the log dir (next to other server state)? The proposal is the profile dir.
-3. **Auto-create on `/execute`.** It's convenient and matches `pageName`, but typos create tabs. Is `tabCreated` enough, or should auto-create require `"create": true`?
+## Decisions on the open questions
+
+These are the defaults as implemented; each is easy to change.
+
+1. **Headful clutter.** The default stays `windows` everywhere: correctness (clicks work) over tidiness. `--tabs-as tabs` (or `$PUPPETEER_SERVER_TABS_AS=tabs`) opts out.
+2. **Registry location.** Profile dir: `<profile>/puppeteer-server-tabs.json`.
+3. **Auto-create on `/execute`.** Kept, reported with `tabCreated: true`. Auto-create still respects `--max-tabs`.

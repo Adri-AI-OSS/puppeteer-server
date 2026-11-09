@@ -60,7 +60,7 @@ This allows any external tool (curl, scripts, AI assistants) to control the brow
 ### 1. Browser Manager (`lib/browser.js`)
 - Launches Chrome/Chromium with optional profile persistence
 - Uses system Chrome by default (better for existing sessions)
-- Manages named pages for reuse across requests
+- Connects to (or re-attaches to) Chrome; named tabs live in `lib/tabs.js`
 
 ### 2. Code Executor (`lib/executor.js`)
 - Executes JavaScript code strings using `AsyncFunction`
@@ -92,11 +92,11 @@ node index.js 8080 https://api.sap.com
 # Or with named arguments
 node index.js --port 8080 --url https://api.sap.com
 
-# Start with pool mode (concurrent execution)
-node index.js --pool --max-tabs 5 --port 8080 --url https://api.sap.com
+# Allow up to 5 tabs besides "main" (default 10)
+node index.js --max-tabs 5 --port 8080 --url https://api.sap.com
 
 # Autonomous mode (skip "Press ENTER" prompt for CI/testing)
-node index.js --pool --max-tabs 5 --port 8080 --no-prompt
+node index.js --port 8080 --no-prompt
 
 # Hardened: token, expired-login detection, limits
 node index.js --port 8080 --token "$TOKEN" --login-url-pattern 'accounts\.sap\.com|/login' \
@@ -112,7 +112,9 @@ node index.js --port 8080 --token "$TOKEN" --login-url-pattern 'accounts\.sap\.c
 
 Other flags: `--token`, `--login-url-pattern`, `--max-queue` (default 50),
 `--max-timeout` (default 600000), `--result-max-bytes` (default 5242880),
-`--job-ttl-ms` (default 600000), `--acquire-timeout` (pool wait, default 30000).
+`--job-ttl-ms` (default 600000), `--max-tabs` (default 10), `--acquire-timeout` (wait
+for a free tab, default 30000), `--tab-idle-ttl` (default 1800000), `--tabs-as
+windows|tabs` (default `windows`). `--pool` is accepted and ignored.
 See `node index.js --help`.
 
 ### Making Requests
@@ -186,14 +188,14 @@ await helpers.waitForContent({
 
 ### Request options
 
-`/execute`, `/run`, `/pool/execute` and `/pool/tab/:id/execute` accept a JSON
-body `{ code, ...options }`:
+`/execute` and `/run` (and the deprecated `/pool/...` execute aliases) accept a
+JSON body `{ code, ...options }`:
 
 | option | default | meaning |
 |---|---|---|
 | `timeout` | `30000` | ms before the run is aborted; capped at `--max-timeout` (response then has `timeoutCappedTo`) |
 | `returnType` | `auto` | `auto`/`json`, `text` or `none` |
-| `pageName` | `main` | named page for the sequential endpoints |
+| `tab` | `main` | which [tab](#tabs) to run on: `main`, any name (created on first use), or `new` (a throwaway tab). `pageName` is an alias |
 | `async` | `false` | respond `202 {jobId, run, poll}` at once; see [Async jobs](#async-jobs) |
 | `pageEvents` | off | `true` (= `console`, `pageerror`, `requestfailed`, `httpError`) or a list of event types; returned as `pageEvents` |
 | `screenshotOnError` | `false` | attach a PNG of the page (`errorScreenshot`) when the run fails or times out |
@@ -205,9 +207,8 @@ body `{ code, ...options }`:
 
 ### Response fields
 
-`/execute` and the pool execute routes return
-`{ success, result | error, stack, run, duration, tabId? }` plus, only when
-relevant:
+`/execute` returns `{ success, result | error, stack, run, duration, tab, tabId? }`
+(`tabId` = `tab` for any tab other than `main`) plus, only when relevant:
 
 | field | meaning |
 |---|---|
@@ -223,6 +224,7 @@ relevant:
 | `tabCrashed` | `{page, url, replaced}`: the named tab had crashed and was replaced before this run |
 | `persisted` / `keptTabs` | what `persist` / `keepTabs` kept |
 | `timeoutCappedTo` | the requested timeout exceeded `--max-timeout` |
+| `tabCreated` | `true` when this run created the named tab (watch for typos) |
 
 `/run` returns only the raw `result`; its `X-Run-Id` header (also set on the
 other execute routes) is the run id: `GET /runs/:id` returns its code, status,
@@ -246,8 +248,7 @@ Each request runs in its own scope:
   the snippet makes through `page`, `page.keyboard/mouse/touchscreen`,
   `browser` or `helpers` throws `RunAbortedError`. So does any such call that
   was already in flight, once it returns. The server waits up to `abortGraceMs`
-  for the snippet to stop before the next queued run (or the next pool user)
-  gets the tab. A snippet that keeps going past that is logged as an `orphan`
+  for the snippet to stop before the next queued run on that tab gets it. A snippet that keeps going past that is logged as an `orphan`
   and can no longer touch the browser. Not covered: element handles and frames
   the snippet already obtained, and non-browser work (timers, `fetch`). For
   those, check `helpers.signal` / `helpers.checkAborted()`.
@@ -270,18 +271,19 @@ Each request runs in its own scope:
   Pass `persist: true` to keep all of it for deliberate multi-call setups, or
   `keepTabs: true` to keep only the tabs. The execution log's `cleanup` field
   lists what was undone.
-- **Focus.** The sequential page is brought to the front before each run.
-  Headless Chrome doesn't render background tabs, so `page.click()` on one never
-  completes. A snippet that opens a popup and then clicks the original page
-  should call `await page.bringToFront()` first. Concurrent pool tabs can't all
-  be in front at once, so in headless mode prefer `evaluate`-based clicks there.
+- **Focus.** Every tab except `main` opens in its own window, so it is always
+  the front tab of its window. That matters because Chrome (headless or not)
+  doesn't render background tabs, and `page.click()` on one never completes.
+  Tabs running in parallel can all click. A snippet that opens a popup and then
+  clicks the original page should still call `await page.bringToFront()` first.
+  `--tabs-as tabs` puts tabs in one window instead, and then only the front tab
+  takes clicks.
 - **Crashes.** A run whose tab crashes fails at once ("The tab crashed during
   the run") instead of waiting for its timeout. If a named tab's renderer
-  crashed, the next request replaces it and reports `tabCrashed`. A crashed pool tab is closed instead of being
-  handed out again. If Chrome itself died, the next request launches a new one
+  crashed, the next request on that tab replaces it (same name, new window) and
+  reports `tabCrashed`. A crashed idle tab is never handed out by `"tab": "new"`. If Chrome itself died, the next request launches a new one
   on the same profile and reports `browserRestarted`.
-- **JS dialogs never freeze a tab.** Every managed page (named pages, the
-  adopted `main` tab, pool tabs) has a default dialog handler. If no other
+- **JS dialogs never freeze a tab.** Every tab has a default dialog handler. If no other
   `dialog` listener is registered, it accepts `alert` and `beforeunload` and
   dismisses `confirm` and `prompt`. Each handled dialog is logged and, if it
   happened during a run, reported in that run's `dialogs`. To answer a dialog
@@ -320,7 +322,7 @@ it in other requests:
 ```bash
 curl -s -XPOST localhost:8080/watch -H 'content-type: application/json' \
   -d '{"events": ["console", "pageerror", "httpError", "framenavigated"], "page": "main"}'
-# -> {"watchId": "w1", ...}      ("tabId": "tab-2" watches a pool tab)
+# -> {"watchId": "w1", ...}      ("tab": "crm" watches another tab)
 curl -s 'localhost:8080/watch/w1?since=0'
 # -> {"events": [{"seq": 1, "ts": "...", "type": "console", "level": "log", "text": "..."}],
 #     "next": 1, "more": false, "dropped": 0, "closed": false}
@@ -346,11 +348,14 @@ curl -X POST http://localhost:8080/run \
 
 ## API Endpoints
 
-### Legacy Endpoints (Sequential Execution)
+### Endpoints
+
+All execute and fixed-purpose routes act on `main` unless given a `tab` (body)
+or `?tab=` (query); see [Tabs](#tabs).
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/execute` | Execute code, return full result with metadata |
+| POST | `/execute` | Execute code on a tab, return full result with metadata |
 | POST | `/run` | Execute code, return raw result only (`X-Run-Id` header = run id) |
 | POST | `/goto` | Navigate to URL |
 | GET | `/page` | Get current URL and title |
@@ -359,13 +364,13 @@ curl -X POST http://localhost:8080/run \
 | GET | `/cookies` | Get session cookies |
 | GET | `/status` | Get queue status |
 | GET | `/health` | Health check |
-| POST | `/clear-queue` | Clear pending executions and abort the running one |
+| POST | `/clear-queue` | Clear queued runs and abort the running ones (`?tab=` for one tab) |
 | POST | `/reconnect` | Re-attach to the running Chrome (launches only if none is alive; never kills Chrome) |
 | POST | `/ready` | Mark the session ready (user finished logging in), instead of pressing ENTER |
 | GET | `/runs` · `/runs/:id` | Recent runs · one run's code, status, error, logs, dialogs, page events |
 | GET | `/jobs` · `/jobs/:id` | Async jobs · one job's progress or result |
 | POST | `/jobs/:id/cancel` | Cancel an async job |
-| POST | `/watch` | Start watching a page's events (`{events, page \| tabId, maxEvents}`) |
+| POST | `/watch` | Start watching a tab's events (`{events, tab, maxEvents}`) |
 | GET | `/watch` · `/watch/:id?since=N` | List watches · read events after cursor `N` |
 | DELETE | `/watch/:id` | Stop a watch |
 | GET | `/artifacts/:id` | A large result or download written to disk |
@@ -386,8 +391,9 @@ reconnects *before* running the request, so the caller doesn't need to call
    launches a new Chrome.
 
 The outcome (`ok`, number of attempts, time taken, endpoint) is logged with the
-request and saved on the run's `exec` record in the executions JSONL. Stale
-pool tabs left over from the old connection are dropped automatically.
+request and saved on the run's `exec` record in the executions JSONL. Every
+named tab is re-adopted by its Chrome target id, so `crm` is still `crm` after a
+reconnect or a server restart (see [Tabs](#tabs)).
 Executed code can't call `browser.disconnect()` or `browser.close()`, because
 the connection is shared by every request.
 
@@ -444,53 +450,71 @@ size, which snippet was running, whether Chrome's PID and DevTools endpoint are
 still alive, and a diagnosis. System sleep and event-loop stalls show up as
 `clock jumped` warnings.
 
-### Pool Endpoints (Concurrent Execution)
+## Tabs
 
-Enable with `--pool` flag: `node index.js --pool --max-tabs 5`
+Every page the server drives is a **tab with a name**:
+
+| kind | name | lifetime |
+|---|---|---|
+| `main` | `main` | the tab the user logged in on; never closed automatically |
+| agent | any name you choose | created with `POST /tabs` or on first use of `"tab": "<name>"`; closed after `--tab-idle-ttl` idle (default 30 min) |
+| throwaway | `tab-N` | created for one `"tab": "new"` run, closed when it ends |
+
+- **One queue per tab.** Runs on one tab are serialized; runs on different tabs
+  run in parallel. A slow run on `crm` never blocks `main`.
+- **Same session.** All tabs share the logged-in browser context (cookies,
+  storage), except `isolated` tabs, which get their own incognito context, e.g.
+  for a logged-out view or a second account.
+- **One window each.** Every tab except `main` opens in its own window, so
+  clicks work on all of them at once (`--tabs-as tabs` to opt out).
+- **Names survive.** `{name → Chrome target id}` is kept in
+  `<profile>/puppeteer-server-tabs.json`. After a reconnect or a server restart
+  every named tab is re-adopted. If Chrome itself died, the old tabs are listed
+  as `lost` for 10 minutes and are created fresh on next use.
+- **Limits.** At most `--max-tabs` tabs besides `main`. `"tab": "new"` waits up
+  to `--acquire-timeout` for a free slot (then 503); `POST /tabs` returns 409
+  with the idle tabs you could close. Each tab's queue holds `--max-queue`
+  requests (then 429).
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/pool/execute` | Execute with automatic tab acquisition/release |
-| POST | `/pool/acquire` | Manually acquire a tab from pool |
-| POST | `/pool/release/:tabId` | Release a tab back to pool |
-| POST | `/pool/tab/:tabId/execute` | Execute code on a specific tab |
-| DELETE | `/pool/tab/:tabId` | Close a specific tab |
-| GET | `/pool/status` | Get pool status (idle/busy/waiting counts) |
-| GET | `/pool/tabs` | Get info for all tabs in pool |
-| POST | `/pool/close-all` | Close all tabs in pool |
-| POST | `/pool/prune` | Close idle tabs (body: `{maxIdleMs: 60000}`) |
-
-## Concurrent Execution
-
-For scraping multiple pages in parallel, use the tab pool feature.
-
-### Starting with Pool Enabled
+| GET | `/tabs` | All tabs: `name, kind, url, title, busy, running, queued, createdAt, lastUsedAt, expiresAt, isolated`; recently lost tabs with `lost: true` |
+| POST | `/tabs` | Create `{ name?, url?, isolated? }` → 201 (name generated if omitted; 409 if it exists or the limit is reached) |
+| GET | `/tabs/:name` | One tab |
+| DELETE | `/tabs/:name` | Close it (`?force=true` for `main` or a busy tab) |
 
 ```bash
-# Enable pool with 5 concurrent tabs
-node index.js --pool --max-tabs 5 --port 8080 --url https://api.sap.com
+# Run on your own tab (created on first use; response has tabCreated: true)
+curl -s localhost:8080/execute -H 'content-type: application/json' \
+  -d '{"tab": "crm", "code": "await page.goto(\"https://crm.example.com\"); return page.title();"}'
+
+# In parallel, on a throwaway tab
+curl -s localhost:8080/execute -H 'content-type: application/json' \
+  -d '{"tab": "new", "code": "await page.goto(\"https://example.com\"); return page.url();"}'
+
+# The fixed-purpose routes take ?tab=
+curl -s 'localhost:8080/screenshot?tab=crm' > crm.png
+curl -s -XDELETE localhost:8080/tabs/crm
 ```
 
-### Using the Pool API
+### Deprecated aliases
 
-```bash
-# Execute with automatic tab management (recommended)
-curl -X POST http://localhost:8080/pool/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code": "await page.goto(\"https://example.com\"); return page.url();"}'
+The earlier page and pool APIs still work and map onto tabs:
 
-# Or manually manage tabs for more control
-# 1. Acquire a tab
-TAB_ID=$(curl -s -X POST http://localhost:8080/pool/acquire | jq -r '.tabId')
+| Old | Same as |
+|---|---|
+| `{ "pageName": "x" }` | `{ "tab": "x" }` (names must now match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`) |
+| `POST /pool/execute` | `POST /execute { "tab": "new" }` (response keeps `tabId`) |
+| `POST /pool/acquire` → `{ tabId }` | a `tab-N` tab you hold until released |
+| `POST /pool/tab/:id/execute` | `POST /execute { "tab": id }` (404 if the tab doesn't exist) |
+| `POST /pool/release/:id` | release the hold; the tab stays idle, is reused by `"tab": "new"`, and expires |
+| `DELETE /pool/tab/:id` | `DELETE /tabs/:id?force=true` |
+| `GET /pool/status`, `GET /pool/tabs` | counts / list over all tabs except `main` (same shapes) |
+| `POST /pool/close-all`, `POST /pool/prune` | close every tab except `main` / idle ones older than `maxIdleMs` |
+| `--pool` | ignored: tabs are always available |
 
-# 2. Execute on that tab
-curl -X POST "http://localhost:8080/pool/tab/$TAB_ID/execute" \
-  -H "Content-Type: application/json" \
-  -d '{"code": "await page.goto(\"https://example.com\"); return page.title();"}'
-
-# 3. Release the tab
-curl -X POST "http://localhost:8080/pool/release/$TAB_ID"
-```
+Behaviour that changed: named pages used to share one global queue, and now
+run in parallel. Pool and agent tabs open in their own windows.
 
 ### Using ConcurrentUrlClient (Node.js)
 
@@ -599,7 +623,7 @@ puppeteer-server/
 │   ├── jobs.js           # Async jobs
 │   ├── watch.js          # Watches (page events across calls)
 │   ├── artifacts.js      # Large results / downloads on disk
-│   ├── tab-pool.js       # Tab pool for concurrent execution
+│   ├── tabs.js           # Named tabs: registry, per-tab queues, windows, persistence
 │   ├── logger.js         # Structured logs + executions JSONL
 │   ├── server.js         # Express HTTP server
 │   └── index.js          # Module exports
@@ -607,11 +631,13 @@ puppeteer-server/
 │   ├── support.js        # Fixture site + server launcher
 │   ├── integration.test.js # Abort, cleanup, dialogs, binaries, console
 │   ├── features.test.js  # Logging, routes, settings/tabs, jobs, watches, files, crashes
-│   └── lifecycle.test.js # Token, /ready, reconnect, Chrome death, server restart
+│   ├── lifecycle.test.js # Token, /ready, reconnect, Chrome death, server restart
+│   └── tabs.test.js      # Named tabs: API, queues, windows, isolation, persistence
 ├── .github/workflows/test.yml # CI: npm test on ubuntu-latest with Chrome
 ├── docs/
 │   ├── PLAN-harness-gaps.md
-│   └── PLAN-2026-11-09-next-features.md
+│   ├── PLAN-2026-11-09-next-features.md
+│   └── DESIGN-2026-11-10-named-tabs.md
 └── examples/
     ├── client.js         # Node.js client library
     └── sap-api-example.sh # Shell script example

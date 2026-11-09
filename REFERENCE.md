@@ -16,7 +16,7 @@ independent process driving its own browser — talk to each on its own port.
 
 1. **Launch it** — from the Adri Libraries tree, hit the play button on
    `@adri/puppeteer-server` → set `port` (and optionally `url`, `headless`,
-   `profile`, `pool`, `maxTabs`) → Execute. It opens an integrated terminal
+   `profile`, `maxTabs`) → Execute. It opens an integrated terminal
    running `node index.js …`.
 2. **Log in once** — a Chrome window opens (omit `headless`). Complete the login
    in that window, then press ENTER in the terminal, or `POST /ready` from
@@ -28,9 +28,30 @@ independent process driving its own browser — talk to each on its own port.
 For headless / CI use, pass `--profile <dir>` once interactively to seed a
 persistent profile, then later runs can use `--headless` against that profile.
 
+## Tabs
+
+Every page is a **tab with a name**. `main` is the tab the user logged in on.
+Pass `"tab": "<name>"` to any execute route to work in your own tab: it is
+created on first use (`tabCreated: true` in the response) and shares the login.
+`"tab": "new"` gives a throwaway tab for one run.
+
+- Runs on the same tab run one after another; runs on different tabs run **in
+  parallel**. To work alongside other agents, use your own tab name.
+- Each tab (except `main`) has its own window, so clicks work in parallel.
+- Tab names survive reconnects and server restarts. Idle agent tabs close after
+  30 minutes; `main` never does.
+- `"isolated": true` on `POST /tabs` gives a tab with its own cookies (a
+  logged-out view or a second account).
+
+| Method & path | Purpose |
+|---|---|
+| `GET /tabs` | List tabs: `name, kind, url, title, busy, queued, expiresAt`; recently lost tabs have `lost: true`. |
+| `POST /tabs` | Create `{ name?, url?, isolated? }` → 201 (409 if it exists or the tab limit is reached). |
+| `GET /tabs/:name` · `DELETE /tabs/:name` | One tab / close it (`?force=true` for `main` or a busy tab). |
+
 ## HTTP API
 
-Single-session (sequential) endpoints:
+Endpoints (each acts on `main` unless given `tab` in the body or `?tab=`):
 
 | Method & path | Purpose |
 |---|---|
@@ -48,26 +69,19 @@ Single-session (sequential) endpoints:
 | `GET /jobs/:id` · `POST /jobs/:id/cancel` | Poll / cancel a job started with `"async": true`. |
 | `POST /watch` · `GET /watch/:id?since=N` · `DELETE /watch/:id` | Collect page events across calls (see below). |
 | `GET /artifacts/:id` | Large results and downloads written to disk. |
-| `POST /clear-queue` | Drop queued sequential requests and abort the one running. |
+| `POST /clear-queue` | Drop queued requests and abort the running ones (`?tab=` for one tab). |
 | `POST /shutdown` | Close the browser and exit. |
 
-Concurrent tab pool (enable with `--pool`):
-
-| Method & path | Purpose |
-|---|---|
-| `POST /pool/execute` | Run a snippet on any free tab. |
-| `POST /pool/acquire` | Reserve a tab → `{ tabId }`. |
-| `POST /pool/tab/:tabId/execute` | Run on a specific reserved tab. |
-| `POST /pool/release/:tabId` | Return a tab to the pool. |
-| `DELETE /pool/tab/:tabId` | Close a tab. |
-| `GET /pool/status` · `GET /pool/tabs` | Pool occupancy. |
-| `POST /pool/close-all` · `POST /pool/prune` | Reclaim tabs. |
+Deprecated but still working: `pageName` (= `tab`), and the `/pool/*` routes.
+`/pool/execute` = `"tab": "new"`. `/pool/acquire` holds a `tab-N` tab until
+`/pool/release/:id`. `/pool/tab/:id/execute` = `"tab": id`. Prefer tabs in new
+code.
 
 ## Writing snippets
 
 The code runs as the body of an async function. In scope:
 
-- `page`: the session's tab (pool routes: the acquired tab). `browser`: the
+- `page`: the run's tab (`main` unless `tab` says otherwise). `browser`: the
   browser; `close()` / `disconnect()` are blocked.
 - `console`: output is returned as `logs`.
 - `helpers`: `wait(ms)`, `waitFor(selector, ms)`, `waitUntil(fn)`,
@@ -89,7 +103,7 @@ Request options (all execute routes):
 |---|---|
 | `timeout` | ms, default 30000, capped by `--max-timeout` (then `timeoutCappedTo` is set) |
 | `returnType` | `auto` \| `text` \| `none` |
-| `pageName` | sequential routes; default `main` |
+| `tab` | `main` (default), any name (created on first use), or `new` (throwaway). `pageName` is an alias |
 | `async` | `true`: respond `202 { jobId, run }` at once; poll `GET /jobs/:id` |
 | `pageEvents` | `true` (console, pageerror, requestfailed, httpError) or a list of types; returned as `pageEvents` |
 | `screenshotOnError` | attach a PNG (`errorScreenshot`) when the run fails or times out |
@@ -112,6 +126,7 @@ Response extras, present only when relevant:
 | `reconnected` | the CDP connection was re-established before this run (`{ ok, attempts, ms }`) |
 | `browserRestarted` | Chrome had died and a new one was launched: session-only cookies and tabs are gone |
 | `tabCrashed` | the named tab had crashed and was replaced |
+| `tab` / `tabCreated` | the tab the run used / `true` if this run created it |
 | `result.$artifact` | the result was too large and is at `result.url` (`GET /artifacts/:id`) |
 | `persisted` / `keptTabs` | what `persist` / `keepTabs` kept |
 
@@ -129,10 +144,10 @@ Behaviour to rely on:
   closes the tabs, popups and incognito contexts the snippet opened. Pass
   `"persist": true` (or `"keepTabs": true`) to keep them. Use `globalThis` or
   the page itself to carry data between calls.
-- **Focus.** The sequential page is brought to the front before each run.
-  Headless Chrome doesn't render background tabs, so `page.click()` there never
-  finishes. If your snippet opens a popup and then clicks the original page,
-  call `await page.bringToFront()` first.
+- **Focus.** Chrome doesn't render background tabs, so `page.click()` on one
+  never finishes. Named tabs avoid this by each having their own window. If your
+  snippet opens a popup and then clicks the original page, call
+  `await page.bringToFront()` first.
 - **Dialogs don't block.** Unless your snippet registers
   `page.on('dialog', ...)`, the server accepts `alert`/`beforeunload` and
   dismisses `confirm`/`prompt`, and reports them in `dialogs`.
@@ -143,13 +158,14 @@ Behaviour to rely on:
 - **Long work.** Use `"async": true` and poll `GET /jobs/:id`. It shows `logs`,
   `dialogs` and `pageEvents` so far, then the full response; `POST
   /jobs/:id/cancel` stops it. Finished jobs expire after 10 minutes.
-- **Watching across calls.** `POST /watch { "events": [...], "page": "main" |
-  "tabId": "tab-1", "maxEvents": 1000 }` returns a `watchId`. Then `GET
+- **Watching across calls.** `POST /watch { "events": [...], "tab": "main",
+  "maxEvents": 1000 }` returns a `watchId`. Then `GET
   /watch/:id?since=<next>` returns new events (`seq`, `ts`, `type`, ...) plus the
   cursor `next`, `dropped` and `closed`. Types: console, pageerror,
   requestfailed, httpError, response, request, framenavigated, popup, dialog.
-- **Backpressure.** A full sequential queue returns `429`. A full pool returns
-  `503` after `--acquire-timeout`. Use `async` or the pool for parallel work.
+- **Backpressure.** A full queue on a tab returns `429`. `"tab": "new"` returns
+  `503` once all `--max-tabs` tabs are in use for `--acquire-timeout`. Use
+  another tab or `async` for parallel work.
 - **Not available:** streaming over one HTTP response, `require` (so you can't
   launch a second browser).
 

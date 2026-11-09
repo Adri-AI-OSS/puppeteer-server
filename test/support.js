@@ -102,13 +102,13 @@ function freePort() {
  *   prompt  true => don't pass --no-prompt
  *   env     extra env vars
  */
-async function startServer({ args = [], tmp, port, token, prompt = false, env = {}, pool = true } = {}) {
+async function startServer({ args = [], tmp, port, token, prompt = false, env = {}, pool = true, headless = true } = {}) {
     tmp = tmp || fs.mkdtempSync(path.join(os.tmpdir(), 'pptr-srv-test-'));
     port = port || await freePort();
     const base = `http://localhost:${port}`;
     const argv = [
         path.join(ROOT, 'index.js'),
-        '--port', String(port), '--headless',
+        '--port', String(port), ...(headless ? ['--headless'] : []),
         '--profile', path.join(tmp, 'profile'), '--log-dir', path.join(tmp, 'logs'),
         ...(pool ? ['--pool', '--max-tabs', '3'] : []),
         ...(prompt ? [] : ['--no-prompt']),
