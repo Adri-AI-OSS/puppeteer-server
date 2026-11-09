@@ -77,17 +77,11 @@
               "arg": ["--profile", "{value}"]
             },
             {
-              "id": "pool",
-              "label": "Enable tab pool (concurrent execution)",
-              "type": "boolean",
-              "default": false,
-              "arg_when_true": ["--pool"]
-            },
-            {
               "id": "maxTabs",
-              "label": "Max tabs (with pool)",
+              "label": "Max tabs (besides main)",
               "type": "number",
               "required": false,
+              "description": "How many named or throwaway tabs agents may open at once besides \"main\" (default 10).",
               "arg": ["--max-tabs", "{value}"]
             }
           ]

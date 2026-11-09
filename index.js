@@ -14,8 +14,9 @@
  *   --url, -u        Initial URL to open (default: none)
  *   --headless       Run in headless mode (default: false)
  *   --profile, -d    Chrome profile directory (default: .chrome-profile)
- *   --pool           Enable tab pool for concurrent execution
- *   --max-tabs       Maximum tabs in pool (default: 10)
+ *   --max-tabs       Maximum tabs besides "main" (default: 10)
+ *   --tabs-as        windows (default) | tabs
+ *   --pool           No-op (tabs are always on)
  *   --log-dir        Directory for log files (default: <repo>/logs)
  *   --log-level      debug | info | warn | error (default: info)
  *   --token          Require `Authorization: Bearer <token>` (or $PUPPETEER_SERVER_TOKEN)
@@ -33,7 +34,7 @@ const net = require('net');
 const path = require('path');
 const BrowserManager = require('./lib/browser');
 const CodeExecutor = require('./lib/executor');
-const TabPoolManager = require('./lib/tab-pool');
+const { TabManager } = require('./lib/tabs');
 const Server = require('./lib/server');
 const log = require('./lib/logger');
 
@@ -62,7 +63,9 @@ function parseArgs(args) {
         maxTimeoutMs: undefined,
         resultMaxBytes: undefined,
         jobTtlMs: undefined,
-        acquireTimeoutMs: undefined
+        acquireTimeoutMs: undefined,
+        tabIdleTtlMs: undefined,
+        tabsAs: process.env.PUPPETEER_SERVER_TABS_AS || undefined
     };
     const num = (v, flag) => {
         const n = Number(v);
@@ -145,6 +148,18 @@ function parseArgs(args) {
                 options.acquireTimeoutMs = num(next, arg);
                 i++;
                 break;
+            case '--tab-idle-ttl':
+                options.tabIdleTtlMs = num(next, arg);
+                i++;
+                break;
+            case '--tabs-as':
+                if (!['windows', 'tabs'].includes(next)) {
+                    console.error(`--tabs-as expects "windows" or "tabs", got: ${next}`);
+                    process.exit(2);
+                }
+                options.tabsAs = next;
+                i++;
+                break;
             case '--help':
             case '-h':
                 printHelp();
@@ -187,8 +202,12 @@ Options:
   --profile, -d <dir>    Chrome profile directory. Defaults to a per-port dir
                          (.chrome-profile/inst-<port>) so concurrent instances
                          don't share a profile; a login persists per port.
-  --pool                 Enable tab pool for concurrent execution
-  --max-tabs <n>         Maximum tabs in pool (default: 10)
+  --max-tabs <n>         Maximum open tabs besides "main" (default: 10)
+  --tab-idle-ttl <ms>    Close agent/pool tabs idle this long (default: 1800000)
+  --tabs-as <mode>       "windows" (default): each tab in its own window, so
+                         every tab renders and clicks work in parallel;
+                         "tabs": tabs share one window
+  --pool                 No-op (kept for compatibility: tabs are always on)
   --no-prompt            Skip "Press ENTER" prompt (for autonomous/CI use)
   --log-dir <dir>        Log directory (default: <repo>/logs, or
                          $PUPPETEER_SERVER_LOG_DIR). Each run writes
@@ -233,16 +252,12 @@ API Endpoints (Legacy - Sequential):
   POST /shutdown         Shutdown server and browser
   GET  /health           Health check
 
-API Endpoints (Pool - Concurrent):
-  POST /pool/execute             Execute with auto tab management
-  POST /pool/acquire             Acquire a tab manually
-  POST /pool/release/:tabId      Release a tab back to pool
-  POST /pool/tab/:tabId/execute  Execute on specific tab
-  DELETE /pool/tab/:tabId        Close a specific tab
-  GET  /pool/status              Get pool status
-  GET  /pool/tabs                Get all tabs info
-  POST /pool/close-all           Close all tabs
-  POST /pool/prune               Prune idle tabs
+Tabs (every execute route takes "tab": "main" | "<name>" | "new"):
+  GET    /tabs               List tabs (name, url, title, busy, queued, ...)
+  POST   /tabs               Create { name?, url?, isolated? }
+  GET    /tabs/:name         One tab
+  DELETE /tabs/:name         Close (?force=true for main or a busy tab)
+  /pool/* routes remain as deprecated aliases (see README).
 
 Example curl commands:
   # Legacy (sequential)
@@ -250,10 +265,10 @@ Example curl commands:
     -H "Content-Type: application/json" \\
     -d '{"code": "return await page.title()"}'
 
-  # Pool (concurrent)
-  curl -X POST http://localhost:3000/pool/execute \\
+  # Your own tab (runs in parallel with other tabs)
+  curl -X POST http://localhost:3000/execute \\
     -H "Content-Type: application/json" \\
-    -d '{"code": "await page.goto(\\"https://example.com\\"); return page.url();"}'
+    -d '{"tab": "crm", "code": "await page.goto(\\"https://example.com\\"); return page.url();"}'
 `);
 }
 
@@ -385,17 +400,15 @@ async function main() {
         profileDir: options.profileDir  // null unless --profile given; set post-bind
     });
 
-    // Initialize tab pool if enabled
-    let tabPoolManager = null;
-    if (options.enablePool) {
-        console.log(`Initializing tab pool (max ${options.maxTabs} tabs)...`);
-        tabPoolManager = new TabPoolManager(browserManager, {
-            maxTabs: options.maxTabs,
-            acquireTimeoutMs: options.acquireTimeoutMs
-        });
-    }
+    // Named tabs (main, agent tabs, throwaway tabs)
+    const tabManager = new TabManager(browserManager, {
+        maxTabs: options.maxTabs,
+        acquireTimeoutMs: options.acquireTimeoutMs,
+        idleTtlMs: options.tabIdleTtlMs,
+        tabsAs: options.tabsAs
+    });
 
-    const executor = new CodeExecutor(browserManager, tabPoolManager, {
+    const executor = new CodeExecutor(browserManager, tabManager, {
         maxQueue: options.maxQueue,
         maxTimeoutMs: options.maxTimeoutMs,
         resultMaxBytes: options.resultMaxBytes,
@@ -403,7 +416,7 @@ async function main() {
     });
     const server = new Server(executor, browserManager, {
         port: options.port,
-        tabPoolManager,
+        tabManager,
         token: options.token,
         jobTtlMs: options.jobTtlMs
     });
@@ -496,14 +509,10 @@ async function main() {
     console.log(`  POST http://localhost:${options.port}/goto     - Navigate to URL`);
     console.log(`  GET  http://localhost:${options.port}/page     - Get current page info`);
 
-    if (options.enablePool) {
-        console.log();
-        console.log('Pool Endpoints (Concurrent):');
-        console.log(`  POST http://localhost:${options.port}/pool/execute     - Execute with auto tab`);
-        console.log(`  POST http://localhost:${options.port}/pool/acquire     - Acquire a tab`);
-        console.log(`  POST http://localhost:${options.port}/pool/release/:id - Release a tab`);
-        console.log(`  GET  http://localhost:${options.port}/pool/status      - Pool status`);
-    }
+    console.log();
+    console.log('Tabs ("tab": "main" | "<name>" | "new" on any execute route):');
+    console.log(`  GET/POST http://localhost:${options.port}/tabs       - List / create tabs`);
+    console.log(`  DELETE   http://localhost:${options.port}/tabs/:name - Close a tab`);
 
     console.log();
     console.log('Example:');
@@ -515,7 +524,7 @@ async function main() {
     console.log(`Logs: ${logFile}`);
     console.log(`Executions (full code): ${log.getExecFilePath()}`);
     console.log();
-    log.info('server', 'ready', { port: options.port, pool: options.enablePool });
+    log.info('server', 'ready', { port: options.port, maxTabs: options.maxTabs, tabsAs: tabManager.opts.tabsAs });
 
     // Handle graceful shutdown
     process.on('SIGINT', async () => {
