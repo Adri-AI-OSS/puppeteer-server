@@ -144,7 +144,8 @@ describe('P1 shared-tab protection', () => {
             print: await page.evaluate(() => matchMedia('print').matches),
             js: page.isJavaScriptEnabled(),
             timeout: page.getDefaultTimeout(),
-            hdr: (await (await fetch(${J(FIX + '/headers')})).json())['x-test'] || null
+            hdr: (await (await fetch(${J(FIX + '/headers')})).json())['x-test'] || null,
+            online: await page.evaluate(() => navigator.onLine)
         };`;
 
     test('#5 settings changed by a run are restored afterwards', async () => {
@@ -156,10 +157,8 @@ describe('P1 shared-tab protection', () => {
             await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'dark' }]);
             await page.setExtraHTTPHeaders({ 'x-test': 'yes' });
             page.setDefaultTimeout(1234);
-            await page.setOfflineMode(true);
-            await page.setOfflineMode(false);
             await page.goto(${J(FIX + '/plain')});
-            return {
+            const out = {
                 w: await page.evaluate(() => innerWidth),
                 ua: await page.evaluate(() => navigator.userAgent),
                 tz: await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone),
@@ -167,10 +166,14 @@ describe('P1 shared-tab protection', () => {
                 print: await page.evaluate(() => matchMedia('print').matches),
                 timeout: page.getDefaultTimeout(),
                 hdr: await page.evaluate(async u => (await (await fetch(u)).json())['x-test'] || null, ${J(FIX + '/headers')})
-            };`);
+            };
+            // Last: going offline would break the network checks above.
+            await page.setOfflineMode(true);
+            out.online = await page.evaluate(() => navigator.onLine);
+            return out;`);
         assert.equal(during.success, true, J(during));
         assert.deepEqual(during.result, { w: 500, ua: 'TestAgent/1.0', tz: 'Asia/Tokyo', dark: true, print: false,
-            timeout: 1234, hdr: 'yes' });
+            timeout: 1234, hdr: 'yes', online: false });
         const cleanup = srv.endRecord(during.run).cleanup.removed;
         assert.deepEqual(cleanup.settings.sort(), ['emulateMediaFeatures', 'emulateTimezone',
             'setDefaultTimeout', 'setExtraHTTPHeaders', 'setOfflineMode', 'setUserAgent', 'setViewport'].sort());
